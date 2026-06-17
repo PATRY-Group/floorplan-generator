@@ -268,7 +268,8 @@ select, input[type="text"] {
 .tabbar {
   width: 100%;
   display: flex;
-  align-items: flex-end;
+  align-items: stretch;   /* tabs hug the bottom line; actions center vertically */
+  min-height: 42px;
   gap: 10px;
   flex-wrap: wrap;
   padding: 4px 0 0;
@@ -305,12 +306,24 @@ select, input[type="text"] {
 .tab.newtab { font-size: 16px; padding: 4px 11px; color: var(--ember); }
 .stagehead .actions {
   display: flex;
-  align-items: center;
+  align-items: center;   /* centered within the 42px strip, level with the tabs */
   gap: 8px;
-  flex-wrap: wrap;
-  padding: 8px 0 10px;
+  margin-left: auto;
 }
 .stagehead .actions .btn { width: auto; padding: 8px 14px; white-space: nowrap; }
+/* Reload + label-toggle: sit inline with the status line, pushed to the right. */
+.actions-right { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.actions-right .btn { width: auto; padding: 6px 12px; white-space: nowrap; font-size: 12px; }
+.actions-right .btn.icon { padding: 6px 11px; font-size: 15px; line-height: 1; }
+/* Library tab: accent so it reads as a destination, not a document tab. */
+.tab.library-tab {
+  margin-left: 8px;
+  color: var(--ember);
+  border-color: rgba(193, 127, 58, 0.45);
+  font-weight: 600;
+}
+.tab.library-tab:hover { color: var(--ember); background: rgba(193, 127, 58, 0.08); }
+.tab.library-tab.active { color: var(--charcoal); }
 
 .statusline {
   width: 100%;
@@ -318,7 +331,11 @@ select, input[type="text"] {
   font-size: 12px;
   color: var(--muted);
   margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
+.statusline .statustext { flex: 1; min-width: 0; }
 
 /* ---- sidebar collapse / resize ---- */
 .resizer {
@@ -363,6 +380,19 @@ select, input[type="text"] {
   height: 40px; max-width: 120px; object-fit: contain;
   border: 1px solid var(--line); border-radius: 4px; background: #fff; padding: 2px;
 }
+
+/* font field: embedded-font row + "installed font instead" link */
+.font-current {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: #fff; font-size: 13px; color: var(--ink);
+}
+.linkish {
+  background: none; border: none; padding: 5px 0 0; margin: 0;
+  color: var(--ember); font-size: 11px; cursor: pointer; text-decoration: underline;
+}
+.linkish:hover { color: var(--charcoal); }
+
 /* Keep the actions pinned to the top of the preview while the sheet scrolls. */
 .stagebar.sticky {
   position: sticky;
@@ -396,12 +426,6 @@ select, input[type="text"] {
 
 /* ---- selected label handle + nudge hint ---- */
 .handle.selected .movearrow { box-shadow: 0 0 0 3px rgba(193, 127, 58, 0.5), 0 1px 3px rgba(0, 0, 0, 0.25); }
-.nudgehint {
-  position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
-  background: rgba(43, 31, 20, 0.85); color: var(--chalk); font-size: 10px;
-  letter-spacing: 0.4px; padding: 3px 9px; border-radius: 10px; pointer-events: none;
-}
-
 /* ---- toasts ---- */
 .toasts {
   position: fixed; bottom: 18px; right: 18px; z-index: 80;

@@ -512,7 +512,9 @@ export default function App() {
                 )}
               </div>
 
-              <KeyPlanPanel key={active.id} onChange={(kp) => patchActive({ keyplan: kp })} />
+              <KeyPlanPanel key={active.id}
+                palette={(properties.find((p) => p.id === propertyId) || {}).palette}
+                onChange={(kp) => patchActive({ keyplan: kp })} />
             </>
           )}
         </aside>
@@ -526,42 +528,6 @@ export default function App() {
 
       <main className="stage">
         <div className="stagehead">
-          {ready && (
-            <div className="actions">
-              <button className="btn ghost" disabled={rendering} onClick={() => doRender(false)}
-                title="Re-render the preview (e.g. after editing the property's brand)">
-                {rendering ? "…" : "⟳ Reload"}
-              </button>
-              <button className="btn ghost" onClick={() => patchActive((d) => ({ showHandles: !d.showHandles }))}
-                title="Hide the move handles to see the final sheet">
-                {active.showHandles ? "Clean view" : "Edit labels"}
-              </button>
-              <button className="btn ember" disabled={saving || rendering || !propertyId}
-                onClick={() => doRender(true)}>
-                {saving ? "Saving…" : "Save to library"}
-              </button>
-              <div className="dropdown">
-                <button className="btn ghost" disabled={!active.svg}
-                  onClick={() => setDlOpen((o) => !o)}>
-                  {pngBusy ? "Rendering…" : "Download ▾"}
-                </button>
-                {dlOpen && (
-                  <>
-                    <div className="dropdown-backdrop" onClick={() => setDlOpen(false)} />
-                    <div className="menu">
-                      <button onClick={() => { setDlOpen(false); downloadCurrentSvg(); }}>SVG</button>
-                      <button disabled={pngBusy}
-                        onClick={() => { setDlOpen(false); downloadCurrentPng(); }}>PNG</button>
-                      <button disabled={pngBusy}
-                        onClick={() => { setDlOpen(false); downloadCurrentSvg(); downloadCurrentPng(); }}>
-                        SVG + PNG
-                      </button>
-                    </div>
-                  </>
-                )}
-              </div>
-            </div>
-          )}
           <div className="tabbar">
             <div className="tabs">
               {docs.map((d) => (
@@ -573,11 +539,39 @@ export default function App() {
                 </span>
               ))}
               <button className="tab newtab" title="New floor plan" onClick={newTab}>+</button>
-              <span className={"tab" + (activeId === "library" ? " active" : "")}
+              <span className={"tab library-tab" + (activeId === "library" ? " active" : "")}
                 onClick={() => setActiveId("library")}>
                 Library{sheets.length ? ` (${sheets.length})` : ""}
               </span>
             </div>
+            {ready && (
+              <div className="actions">
+                <button className="btn ember" disabled={saving || rendering || !propertyId}
+                  onClick={() => doRender(true)}>
+                  {saving ? "Saving…" : "Save to library"}
+                </button>
+                <div className="dropdown">
+                  <button className="btn ghost" disabled={!active.svg}
+                    onClick={() => setDlOpen((o) => !o)}>
+                    {pngBusy ? "Rendering…" : "Download ▾"}
+                  </button>
+                  {dlOpen && (
+                    <>
+                      <div className="dropdown-backdrop" onClick={() => setDlOpen(false)} />
+                      <div className="menu">
+                        <button onClick={() => { setDlOpen(false); downloadCurrentSvg(); }}>SVG</button>
+                        <button disabled={pngBusy}
+                          onClick={() => { setDlOpen(false); downloadCurrentPng(); }}>PNG</button>
+                        <button disabled={pngBusy}
+                          onClick={() => { setDlOpen(false); downloadCurrentSvg(); downloadCurrentPng(); }}>
+                          SVG + PNG
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -593,11 +587,23 @@ export default function App() {
         ) : (
           <>
             <div className="statusline">
-              {rendering ? <span className="spin">rendering…</span>
-                : active.renderError ? <span style={{ color: "#8a3d28" }}>{active.renderError}</span>
-                : active.showHandles
-                  ? "Live preview — drag to move a label, double-click to reset. Click “Clean view” to see the floorplan without the edit icons."
-                  : "Clean view — edit icons hidden. Click “Edit labels” to move labels again."}
+              <span className="statustext">
+                {rendering ? <span className="spin">rendering…</span>
+                  : active.renderError ? <span style={{ color: "#8a3d28" }}>{active.renderError}</span>
+                  : active.showHandles
+                    ? "Live preview — drag to move a label, double-click to reset. Click “Clean view” to hide edit icons."
+                    : "Clean view — edit icons hidden. Click “Edit labels” to move labels again."}
+              </span>
+              <div className="actions-right">
+                <button className="btn ghost" onClick={() => patchActive((d) => ({ showHandles: !d.showHandles }))}
+                  title="Hide the move handles to see the final sheet">
+                  {active.showHandles ? "Clean view" : "Edit labels"}
+                </button>
+                <button className="btn ghost icon" disabled={rendering} onClick={() => doRender(false)}
+                  title="Reload — re-render the preview (e.g. after editing the property's brand)">
+                  {rendering ? "…" : "⟳"}
+                </button>
+              </div>
             </div>
             {active.svg
               ? <LabelOverlay svg={active.svg} meta={active.placement} showHandles={active.showHandles}
