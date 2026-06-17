@@ -1,0 +1,30 @@
+{
+  "id": "800-princess",
+  "name": "PRINCESS",
+  "location": "KINGSTON · ON",
+  "lockup": "800",
+  "watermark": "800",
+  "footer_address": "800 PRINCESS ST · KINGSTON, ON",
+  "header_right": "FLOOR PLAN",
+  "disclaimer": "FOR ILLUSTRATIVE PURPOSES ONLY. DIMENSIONS ARE APPROXIMATE AND SUBJECT TO CHANGE.",
+  "palette": {
+    "dark": "#2B1F14",
+    "accent": "#C17F3A",
+    "mid": "#E8D9C0",
+    "light": "#F7F3ED"
+  },
+  "fonts": {
+    "serif": "Georgia, 'Times New Roman', serif",
+    "sans": "'Helvetica Neue', Helvetica, Arial, sans-serif"
+  },
+  "layer_map": {
+    "wall_line": ["A-WALL", "I-WALL"],
+    "wall_fill": ["A-WALL-PATT"],
+    "door": ["A-DOOR", "A-DOOR-FRAM"],
+    "glazing": ["A-GLAZ"],
+    "dashed": ["A-DETL-HDLN", "A-FLOR-OVHD"],
+    "room_label": ["G-ANNO-TEXT"],
+    "drop": ["A-AREA-IDEN", "S-COLS-SYMB", "S-STRS", "S-STRS-MBND"],
+    "floor_hatch": ["A-FLOR"]
+  }
+}
