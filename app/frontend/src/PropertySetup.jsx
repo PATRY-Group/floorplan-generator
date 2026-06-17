@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { saveProperty, deleteProperty, extractBrand } from "./api.js";
+import { saveProperty, deleteProperty, extractBrand, fontInfo } from "./api.js";
 
 const DEFAULT_LAYER_MAP = {
   wall_line: ["A-WALL", "I-WALL"],
@@ -30,15 +30,35 @@ const PALETTE_ROLES = [
   ["light", "Light / background", "page bg + label halos"],
 ];
 
+// Curated, broadly-installed font stacks so the PNG export (cairo) matches the
+// browser preview rather than silently falling back.
+const FONT_PRESETS = {
+  serif: [
+    ["Georgia", "Georgia, 'Times New Roman', serif"],
+    ["Times New Roman", "'Times New Roman', Times, serif"],
+    ["Garamond", "Garamond, 'Times New Roman', serif"],
+    ["Palatino", "'Palatino Linotype', Palatino, serif"],
+  ],
+  sans: [
+    ["Helvetica Neue", "'Helvetica Neue', Helvetica, Arial, sans-serif"],
+    ["Arial", "Arial, Helvetica, sans-serif"],
+    ["Verdana", "Verdana, Geneva, sans-serif"],
+    ["Trebuchet MS", "'Trebuchet MS', Helvetica, sans-serif"],
+    ["Tahoma", "Tahoma, Geneva, sans-serif"],
+  ],
+};
+
 const slug = (s) =>
   s.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
+const numFrom = (s) => (String(s || "").match(/\d+/) || [""])[0];
 
 export default function PropertySetup({ initial, onClose, onSaved, onDeleted }) {
   const isNew = !initial;
   const [p, setP] = useState(() => ({
     id: initial?.id || "",
     name: initial?.name || "",
-    location: initial?.location || "",
+    location: initial?.location || (initial ? "" : "KINGSTON, ON"),
     lockup: initial?.lockup || "",
     watermark: initial?.watermark || "",
     watermark_image: initial?.watermark_image || null,
@@ -53,18 +73,116 @@ export default function PropertySetup({ initial, onClose, onSaved, onDeleted }) 
       mid: initial?.palette?.mid || "#E8D9C0",
       light: initial?.palette?.light || "#F7F3ED",
     },
-    fonts: initial?.fonts || null,
+    fonts: {
+      serif: initial?.fonts?.serif || "Georgia, 'Times New Roman', serif",
+      sans: initial?.fonts?.sans || "'Helvetica Neue', Helvetica, Arial, sans-serif",
+    },
+    brand_swatches: initial?.brand_swatches || null,
+    font_faces: initial?.font_faces || null,
     layer_map: initial?.layer_map || DEFAULT_LAYER_MAP,
   }));
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [err, setErr] = useState("");
   const [extracting, setExtracting] = useState(false);
-  const [brand, setBrand] = useState(null);     // {swatches, fonts, source}
+  // Seed the swatch strip from previously-detected colors so editing a property
+  // doesn't require re-uploading the brand file just to re-pick a color.
+  const [brand, setBrand] = useState(
+    initial?.brand_swatches?.length
+      ? { swatches: initial.brand_swatches, fonts: [], source: "saved" }
+      : null
+  );
   const [activeRole, setActiveRole] = useState(null);
+  // For a new property, auto-derive lockup + watermark from the building number
+  // in the name (e.g. "800 PRINCESS" -> "800") until the user edits them.
+  const [lockTouched, setLockTouched] = useState(!!initial?.lockup);
+  const [wmTouched, setWmTouched] = useState(!!initial?.watermark);
+  const [typeMode, setTypeMode] = useState({});   // role -> show the installed-name text box
 
   const set = (k, v) => setP((o) => ({ ...o, [k]: v }));
   const setPal = (k, v) => setP((o) => ({ ...o, palette: { ...o.palette, [k]: v } }));
+  const setFont = (k, v) => setP((o) => ({ ...o, fonts: { ...o.fonts, [k]: v } }));
+  const faceFor = (role) => (p.font_faces || []).find((f) => f.role === role) || null;
+
+  // Upload a brand font file: the backend reads its family name and returns it
+  // embedded, so the sheet can render it (preview + PNG) without installing it.
+  async function onFontFile(role, e) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setErr("");
+    try {
+      const info = await fontInfo(file);   // { family, data, format }
+      setP((o) => {
+        const faces = (o.font_faces || []).filter((f) => f.role !== role);
+        faces.push({ role, family: info.family, data: info.data, format: info.format });
+        return { ...o, fonts: { ...o.fonts, [role]: info.family }, font_faces: faces };
+      });
+    } catch (e2) {
+      setErr(e2.message);
+    }
+  }
+  function removeFace(role, presets) {
+    setTypeMode((m) => ({ ...m, [role]: false }));
+    setP((o) => {
+      const faces = (o.font_faces || []).filter((f) => f.role !== role);
+      return { ...o, fonts: { ...o.fonts, [role]: presets[0][1] },
+               font_faces: faces.length ? faces : null };
+    });
+  }
+
+  // Upload is the primary path (embeds the font so it renders anywhere). The
+  // type-an-installed-name box is tucked behind a small link. Rendered as a
+  // plain function so the text input keeps focus across keystrokes.
+  const fontField = (role, label, presets) => {
+    const cur = p.fonts[role] || "";
+    const face = faceFor(role);
+    const known = presets.some(([, s]) => s === cur);
+    const typing = !face && (typeMode[role] || (!known && !!cur));
+    return (
+      <div>
+        <label>{label}</label>
+        {face ? (
+          <div className="font-current">
+            <span>{face.family} <span className="subtle">· embedded</span></span>
+            <button type="button" className="chip" onClick={() => removeFace(role, presets)}>✕</button>
+          </div>
+        ) : typing ? (
+          <input type="text" value={cur} placeholder="Installed font name, e.g. Oswald"
+            onChange={(e) => setFont(role, e.target.value)} />
+        ) : (
+          <select value={known ? cur : presets[0][1]}
+            onChange={(e) => setFont(role, e.target.value)}>
+            {presets.map(([l, s]) => <option key={s} value={s}>{l}</option>)}
+          </select>
+        )}
+        <div className="wm-upload" style={{ marginTop: 6 }}>
+          <label className="btn ghost file-btn">
+            {face ? "Replace font…" : "Upload font (.ttf/.otf)…"}
+            <input type="file" accept=".ttf,.otf,.ttc" hidden
+              onChange={(e) => onFontFile(role, e)} />
+          </label>
+        </div>
+        {!face && (
+          <button type="button" className="linkish"
+            onClick={() => {
+              if (typing) { setTypeMode((m) => ({ ...m, [role]: false })); setFont(role, presets[0][1]); }
+              else { setTypeMode((m) => ({ ...m, [role]: true })); setFont(role, ""); }
+            }}>
+            {typing ? "use a preset instead" : "use a font already installed on this computer"}
+          </button>
+        )}
+      </div>
+    );
+  };
+  function handleName(v) {
+    const num = numFrom(v);
+    setP((o) => ({
+      ...o, name: v,
+      ...(lockTouched ? {} : { lockup: num }),
+      ...(wmTouched ? {} : { watermark: num }),
+    }));
+  }
   const setLayers = (role, csv) =>
     setP((o) => ({
       ...o,
@@ -105,7 +223,8 @@ export default function PropertySetup({ initial, onClose, onSaved, onDeleted }) 
     try {
       const res = await extractBrand(file);
       setBrand(res);
-      setP((o) => ({ ...o, palette: { ...o.palette, ...res.palette } }));
+      setP((o) => ({ ...o, palette: { ...o.palette, ...res.palette },
+                     brand_swatches: res.swatches || o.brand_swatches }));
     } catch (e2) {
       setErr(e2.message);
     } finally {
@@ -170,7 +289,7 @@ export default function PropertySetup({ initial, onClose, onSaved, onDeleted }) 
               <div>
                 <label>Name</label>
                 <input type="text" value={p.name}
-                  onChange={(e) => set("name", e.target.value)} placeholder="PRINCESS" />
+                  onChange={(e) => handleName(e.target.value)} placeholder="800 PRINCESS" />
               </div>
               <div>
                 <label>Location</label>
@@ -182,13 +301,14 @@ export default function PropertySetup({ initial, onClose, onSaved, onDeleted }) 
               <div>
                 <label>Header lockup</label>
                 <input type="text" value={p.lockup}
-                  onChange={(e) => set("lockup", e.target.value)} placeholder="800" />
+                  onChange={(e) => { setLockTouched(true); set("lockup", e.target.value); }}
+                  placeholder="800" />
               </div>
               <div>
                 <label>Watermark</label>
                 <input type="text" value={p.watermark}
-                  onChange={(e) => set("watermark", e.target.value)} placeholder="800"
-                  disabled={!!p.watermark_image} />
+                  onChange={(e) => { setWmTouched(true); set("watermark", e.target.value); }}
+                  placeholder="800" disabled={!!p.watermark_image} />
               </div>
             </div>
             <label>Watermark image (optional — overrides the text watermark)</label>
@@ -286,6 +406,20 @@ export default function PropertySetup({ initial, onClose, onSaved, onDeleted }) 
                 <span style={{ color: "#fff", fontFamily: "Georgia, serif" }}>UNIT</span>
                 <span style={{ background: pal.accent, height: 3, width: 28, display: "inline-block" }} />
               </div>
+            </div>
+          </section>
+
+          <section>
+            <h3>Floor plan fonts</h3>
+            <p className="subtle">
+              Display face styles the lockup, unit title and watermark; the body
+              face is everything else. Upload a .ttf/.otf to embed a brand font
+              (e.g. Oswald) so it renders in the preview and the PNG without being
+              installed anywhere. Or pick a preset / type an installed font name.
+            </p>
+            <div className="row">
+              {fontField("serif", "Display font", FONT_PRESETS.serif)}
+              {fontField("sans", "Body font", FONT_PRESETS.sans)}
             </div>
           </section>
 
