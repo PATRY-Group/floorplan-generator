@@ -89,6 +89,11 @@ def render(prims, config):
     palette = {**DEFAULT_PALETTE, **(config.get("palette") or {})}
     DARK, ACCENT, MID, LIGHT = (palette["dark"], palette["accent"],
                                 palette["mid"], palette["light"])
+    # The drawn floor plan (walls, poché, doors, glazing) renders in its own
+    # ink — black by default — independent of the brand "dark" colour, which
+    # styles the header/footer bands, watermark and labels. Overridable via
+    # palette["wall"] for a property on a different convention.
+    WALL = palette.get("wall") or "#000000"
     fonts = config.get("fonts") or {}
     SERIF = fonts.get("serif", DEFAULT_SERIF)
     SANS = fonts.get("sans", DEFAULT_SANS)
@@ -256,6 +261,25 @@ def render(prims, config):
     location = esc((md.get("location") or "").upper())
     lockup = esc(md.get("lockup") or "")
     watermark = esc(md.get("watermark") or lockup or "")
+    # Centered ghost watermark behind the plan: an uploaded image if provided,
+    # otherwise the text mark sized to fit the page width (so a longer mark like
+    # "2274" scales down instead of overflowing the fixed 430px size).
+    wm_img = md.get("watermark_image")
+    wm_cx, wm_cy = PAGE_W / 2, plan_top + plan_h / 2
+    if wm_img:
+        wm_box = 460.0
+        watermark_svg = (
+            f'<image href="{wm_img}" x="{wm_cx - wm_box / 2:.0f}" '
+            f'y="{wm_cy - wm_box / 2:.0f}" width="{wm_box:.0f}" height="{wm_box:.0f}" '
+            f'opacity="0.08" preserveAspectRatio="xMidYMid meet"/>')
+    elif watermark:
+        wm_size = min(430.0, 1500.0 / max(len(watermark), 1))
+        watermark_svg = (
+            f'<text x="{wm_cx:.0f}" y="{wm_cy:.0f}" text-anchor="middle" '
+            f'dominant-baseline="central" font-family="{SERIF}" font-weight="bold" '
+            f'font-size="{wm_size:.0f}" fill="{ACCENT}" fill-opacity="0.07">{watermark}</text>')
+    else:
+        watermark_svg = ""
     footer_addr = esc((md.get("footer_address") or "").upper())
     header_right = esc((md.get("header_right") or "FLOOR PLAN").upper())
     disclaimer = esc(md.get("disclaimer") or
@@ -294,9 +318,7 @@ def render(prims, config):
 
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {PAGE_W} {PAGE_H}" font-family="{SANS}">
   <rect width="{PAGE_W}" height="{PAGE_H}" fill="{LIGHT}"/>
-  <text x="{PAGE_W/2}" y="{plan_top + plan_h/2 + 150:.0f}" text-anchor="middle"
-        font-family="{SERIF}" font-weight="bold" font-size="430"
-        fill="{ACCENT}" fill-opacity="0.07">{watermark}</text>
+  {watermark_svg}
   <rect width="{PAGE_W}" height="{HEADER_H}" fill="{DARK}"/>
   <text x="{lockup_x}" y="62" font-family="{SERIF}" font-weight="bold" font-size="44" fill="{ACCENT}">{lockup}</text>
   <line x1="{divider_x:.0f}" y1="24" x2="{divider_x:.0f}" y2="68" stroke="{ACCENT}" stroke-width="1.2" stroke-opacity="0.7"/>
@@ -304,13 +326,13 @@ def render(prims, config):
   <text x="{name_x:.0f}" y="71" font-size="11" letter-spacing="4" fill="{MID}" fill-opacity="0.85">{location}</text>
   <text x="{PAGE_W-60}" y="56" text-anchor="end" font-size="11" letter-spacing="3.5" fill="{MID}" fill-opacity="0.7">{header_right}</text>
   <g stroke-linecap="round" stroke-linejoin="round" fill="none">
-    <path d="{' '.join(wall_fills)}" fill="{DARK}" stroke="none" fill-rule="nonzero"/>
-{polyline_group(wall_lines, f'stroke="{DARK}" stroke-width="1.6"')}
-{polyline_group(glaz_lines, f'stroke="{DARK}" stroke-width="0.9"')}
-{polyline_group(door_lines, f'stroke="{DARK}" stroke-width="1.0"')}
-{polyline_group(swing_lines, f'stroke="{DARK}" stroke-width="0.7" stroke-opacity="0.45"')}
-{polyline_group(thin_lines, f'stroke="{DARK}" stroke-width="0.6" stroke-opacity="0.55"')}
-{polyline_group(dash_lines, f'stroke="{DARK}" stroke-width="0.6" stroke-opacity="0.35" stroke-dasharray="4 3"')}
+    <path d="{' '.join(wall_fills)}" fill="{WALL}" stroke="none" fill-rule="nonzero"/>
+{polyline_group(wall_lines, f'stroke="{WALL}" stroke-width="1.6"')}
+{polyline_group(glaz_lines, f'stroke="{WALL}" stroke-width="0.9"')}
+{polyline_group(door_lines, f'stroke="{WALL}" stroke-width="1.0"')}
+{polyline_group(swing_lines, f'stroke="{WALL}" stroke-width="0.7" stroke-opacity="0.45"')}
+{polyline_group(thin_lines, f'stroke="{WALL}" stroke-width="0.6" stroke-opacity="0.55"')}
+{polyline_group(dash_lines, f'stroke="{WALL}" stroke-width="0.6" stroke-opacity="0.35" stroke-dasharray="4 3"')}
   </g>
 {chr(10).join(room_labels)}
   <rect y="{PAGE_H-FOOTER_H}" width="{PAGE_W}" height="{FOOTER_H}" fill="{DARK}"/>
