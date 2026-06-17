@@ -32,7 +32,8 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 
 from engine import (parse_dxf, ParseError, DEFAULT_LAYER_MAP, render,
-                    render_keyplan_sheet, dwg_to_dxf, converter_available,
+                    render_keyplan_sheet, trace_plate, colorize_trace,
+                    dwg_to_dxf, converter_available,
                     ConversionError, extract_brand, BrandError)
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -104,6 +105,7 @@ def compose_config(prop, metadata, rooms, palette_override=None, layer_map_overr
     meta.update({k: v for k, v in (metadata or {}).items() if v is not None})
     return {"palette": palette_override or prop.get("palette"),
             "fonts": prop.get("fonts"),
+            "font_faces": prop.get("font_faces"),
             "layer_map": layer_map_override or prop.get("layer_map") or DEFAULT_LAYER_MAP,
             "metadata": meta, "rooms": rooms or []}
 
@@ -115,6 +117,91 @@ def _plate_bytes(plate_id):
         with open(fn, "rb") as f:
             return f.read()
     return None
+
+
+def _css_family(fam):
+    return (fam or "").replace("\\", "").replace("'", "")
+
+
+def _apply_custom_fonts(svg, png, font_faces):
+    """Make uploaded brand fonts render everywhere. cairosvg ignores embedded
+    fonts, so when a property carries font faces we (1) inline an @font-face so
+    the SVG renders the font in any browser, and (2) re-render the PNG with
+    resvg, which honours fonts loaded from files. Falls back to the cairosvg PNG
+    if resvg is unavailable — the SVG still carries the font either way."""
+    faces = [f for f in (font_faces or []) if f.get("data") and f.get("family")]
+    if not faces:
+        return svg, png
+    style = "<style>" + "".join(
+        "@font-face{font-family:'%s';src:url(%s);}" % (_css_family(f["family"]), f["data"])
+        for f in faces) + "</style>"
+    svg2 = svg.replace(">", ">" + style, 1)   # inject right after the <svg …> tag
+    tmp = []
+    try:
+        import tempfile
+        import resvg_py
+        for f in faces:
+            head, _, b64 = f["data"].partition(",")
+            ext = ".otf" if ("otf" in head or "opentype" in head) else ".ttf"
+            fd, path = tempfile.mkstemp(suffix=ext)
+            os.write(fd, base64.b64decode(b64))
+            os.close(fd)
+            tmp.append(path)
+        png2 = bytes(resvg_py.svg_to_bytes(svg_string=svg2, width=900, font_files=tmp))
+        return svg2, png2
+    except Exception:
+        return svg2, png
+    finally:
+        for p in tmp:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+@app.post("/font-info")
+async def font_info(file: UploadFile = File(...)):
+    """Read a TTF/OTF font's family name (so the sheet can reference it) and
+    return it embedded as a data URI to store on the property."""
+    raw = await file.read()
+    if len(raw) > 4 * 1024 * 1024:
+        raise HTTPException(status_code=413,
+                            detail="Font file too large (max 4 MB). Use a single TTF/OTF weight.")
+    ext = os.path.splitext((file.filename or "").lower())[1]
+    if ext not in (".ttf", ".otf", ".ttc"):
+        raise HTTPException(status_code=415, detail=(
+            "Use a .ttf or .otf font file (not WOFF) so the PNG export can embed it."))
+    try:
+        from fontTools.ttLib import TTFont, TTCollection
+        f = (TTCollection(io.BytesIO(raw)).fonts[0] if ext == ".ttc"
+             else TTFont(io.BytesIO(raw)))
+        nm = f["name"]
+        family = (nm.getDebugName(16) or nm.getDebugName(1)
+                  or os.path.splitext(os.path.basename(file.filename or "Font"))[0])
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Couldn't read that font: {exc}")
+    mime = "font/otf" if ext == ".otf" else "font/ttf"
+    data = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+    return {"family": family, "data": data,
+            "format": "opentype" if ext == ".otf" else "truetype"}
+
+
+def _trace_mask(plate_id, seal):
+    """Auto-traced footprint mask for (plate, seal), computed once and cached on
+    disk (the morphology + BFS are too slow to run per render). Returns the
+    grayscale mask PNG bytes and coverage fraction, or (None, 0.0) if no plate."""
+    seal = max(7, min(61, int(seal) | 1))   # clamp + force odd
+    cache = os.path.join(UP_DIR, f"{plate_id}_trace{seal}.png")
+    if os.path.isfile(cache):
+        with open(cache, "rb") as f:
+            return f.read(), None
+    raw = _plate_bytes(plate_id)
+    if not raw:
+        return None, 0.0
+    mask, cov = trace_plate(raw, seal=seal)
+    with open(cache, "wb") as f:
+        f.write(mask)
+    return mask, cov
 
 
 # --------------------------------------------------------------------------- #
@@ -198,6 +285,25 @@ async def upload_plate(file: UploadFile = File(...)):
     return {"plate_id": plate_id, "width": w, "height": h}
 
 
+class TraceRequest(BaseModel):
+    plate_id: str
+    seal: int = 35
+    palette: Optional[Dict[str, str]] = None
+
+
+@app.post("/plate/trace")
+def trace_plate_preview(req: TraceRequest):
+    """Auto-trace a plate into a footprint silhouette and return a coloured
+    preview (data URI) + coverage, so the UI can show the result, let the user
+    tune seal strength, and fall back to the raw screenshot if it won't trace."""
+    mask, cov = _trace_mask(req.plate_id, req.seal)
+    if mask is None:
+        raise HTTPException(status_code=404, detail="Plate not found or expired.")
+    png = colorize_trace(mask, req.palette or {})
+    data_uri = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    return {"preview": data_uri, "coverage": cov}
+
+
 # --------------------------------------------------------------------------- #
 # brand extraction (property setup auto-fill)
 # --------------------------------------------------------------------------- #
@@ -244,11 +350,17 @@ def do_render(req: RenderRequest):
     if req.keyplan:
         kp = dict(req.keyplan)
         kp["plate_bytes"] = _plate_bytes(kp.get("plate_id"))
+        if kp.get("mode") == "traced" and kp.get("plate_id"):
+            mask, _ = _trace_mask(kp["plate_id"], kp.get("seal", 35))
+            if mask is not None:
+                kp["silhouette_bytes"] = colorize_trace(mask, config.get("palette") or {})
         config["keyplan"] = kp
     try:
         svg, png, meta = render(prims, config)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Render failed: {exc}")
+    # Embed any uploaded brand fonts so they render in both the SVG and the PNG.
+    svg, png = _apply_custom_fonts(svg, png, config.get("font_faces"))
 
     keyplan_svg = None
     if req.keyplan and req.keyplan.get("placement") == "standalone":
@@ -323,6 +435,8 @@ class Property(BaseModel):
     disclaimer: Optional[str] = None
     palette: Dict[str, str] = {}
     fonts: Optional[Dict[str, str]] = None
+    brand_swatches: Optional[List[Dict[str, Any]]] = None  # detected colors, kept for re-picking
+    font_faces: Optional[List[Dict[str, Any]]] = None      # uploaded brand fonts: {family, data, format}
     layer_map: Dict[str, List[str]] = {}
 
 
