@@ -3,6 +3,7 @@ Floor Plan Sheet Generator — backend service.
 
   POST /parse                         DXF/DWG upload -> geometry cached + labels
   POST /plate                         floor-plate image upload (key plans)
+  POST /extract-brand                 brand PDF/image -> auto palette + font hints
   POST /render                        config (+ optional key plan) -> SVG/PNG
   GET  /properties                    list configured properties
   GET/PUT/DELETE /properties/{id}     property CRUD (brand + layer map)
@@ -15,6 +16,7 @@ Floor Plan Sheet Generator — backend service.
 State lives on disk under data/. The uploads cache is swept automatically.
 """
 
+import base64
 import glob
 import io
 import json
@@ -31,7 +33,7 @@ from typing import Optional, List, Dict, Any
 
 from engine import (parse_dxf, ParseError, DEFAULT_LAYER_MAP, render,
                     render_keyplan_sheet, dwg_to_dxf, converter_available,
-                    ConversionError)
+                    ConversionError, extract_brand, BrandError)
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(BASE, "data")
@@ -94,6 +96,7 @@ def compose_config(prop, metadata, rooms, palette_override=None, layer_map_overr
         "location": prop.get("location", ""),
         "lockup": prop.get("lockup", ""),
         "watermark": prop.get("watermark", prop.get("lockup", "")),
+        "watermark_image": prop.get("watermark_image"),
         "footer_address": prop.get("footer_address", ""),
         "header_right": prop.get("header_right", "FLOOR PLAN"),
         "disclaimer": prop.get("disclaimer"),
@@ -196,6 +199,20 @@ async def upload_plate(file: UploadFile = File(...)):
 
 
 # --------------------------------------------------------------------------- #
+# brand extraction (property setup auto-fill)
+# --------------------------------------------------------------------------- #
+@app.post("/extract-brand")
+async def extract_brand_file(file: UploadFile = File(...)):
+    raw = await file.read()
+    if len(raw) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Brand file too large (max 25 MB).")
+    try:
+        return extract_brand(raw, file.filename or "")
+    except BrandError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+# --------------------------------------------------------------------------- #
 # render
 # --------------------------------------------------------------------------- #
 class RenderRequest(BaseModel):
@@ -207,6 +224,7 @@ class RenderRequest(BaseModel):
     layer_map: Optional[Dict[str, List[str]]] = None
     keyplan: Optional[Dict[str, Any]] = None
     save: bool = False
+    want_png: bool = False   # include base64 PNG in the response (for download)
 
 
 def _load_prims(doc_id):
@@ -267,7 +285,9 @@ def do_render(req: RenderRequest):
                           "created": time.strftime("%Y-%m-%d %H:%M")})
         json.dump(sheets, open(index, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 
-    return {"svg": svg, "keyplan_svg": keyplan_svg, "sheet_id": sheet_id, "meta": meta}
+    png_b64 = base64.b64encode(png).decode("ascii") if req.want_png else None
+    return {"svg": svg, "keyplan_svg": keyplan_svg, "sheet_id": sheet_id,
+            "meta": meta, "png_b64": png_b64}
 
 
 # --------------------------------------------------------------------------- #
@@ -297,6 +317,7 @@ class Property(BaseModel):
     location: str = ""
     lockup: str = ""
     watermark: str = ""
+    watermark_image: Optional[str] = None   # data URI; overrides the text watermark
     footer_address: str = ""
     header_right: str = "FLOOR PLAN"
     disclaimer: Optional[str] = None
