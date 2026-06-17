@@ -6,7 +6,7 @@ import React, { useLayoutEffect, useRef, useState, useCallback } from "react";
  * auto-placement. Pixel/viewBox -> DXF conversion uses the server transform:
  *   svgX = tx + dxfX*s ;  dxfX = (svgX - tx)/s ;  dxfY = (ty - svgY)/s
  */
-export default function LabelOverlay({ svg, meta, onMove, onReset }) {
+export default function LabelOverlay({ svg, meta, onMove, onReset, showHandles = true }) {
   const wrapRef = useRef(null);
   const [scale, setScale] = useState(1);
   const [drag, setDrag] = useState(null);     // {i, x, y} viewBox coords
@@ -31,18 +31,25 @@ export default function LabelOverlay({ svg, meta, onMove, onReset }) {
     return [(vbx - tx) / s, (ty - vby) / s];
   }
 
+  // Pointer client coords -> viewBox coords.
+  function pointerVB(e) {
+    const rect = wrapRef.current.getBoundingClientRect();
+    return [(e.clientX - rect.left) / scale, (e.clientY - rect.top) / scale];
+  }
+
   function startDrag(e, p) {
     e.preventDefault();
     e.target.setPointerCapture?.(e.pointerId);
+    const [vx, vy] = pointerVB(e);
     setSelected(p.i);
-    setDrag({ i: p.i, x: p.px, y: p.py });
+    // Remember where on the handle we grabbed so the label tracks the cursor
+    // from that point instead of snapping its anchor under the pointer.
+    setDrag({ i: p.i, x: p.px, y: p.py, ox: vx - p.px, oy: vy - p.py });
   }
   function onPointerMove(e) {
     if (!drag || !wrapRef.current) return;
-    const rect = wrapRef.current.getBoundingClientRect();
-    setDrag((d) => ({ ...d,
-      x: (e.clientX - rect.left) / scale,
-      y: (e.clientY - rect.top) / scale }));
+    const [vx, vy] = pointerVB(e);
+    setDrag((d) => ({ ...d, x: vx - d.ox, y: vy - d.oy }));
   }
   function endDrag() {
     if (!drag || !meta) return;
@@ -76,7 +83,7 @@ export default function LabelOverlay({ svg, meta, onMove, onReset }) {
       onClick={(e) => { if (e.target === e.currentTarget) setSelected(null); }}
     >
       <div dangerouslySetInnerHTML={{ __html: svg }} />
-      <div className="handles">
+      {showHandles && <div className="handles">
         {placements.map((p) => {
           const live = drag && drag.i === p.i ? drag : null;
           const left = (live ? live.x : p.px) * scale;
@@ -88,18 +95,31 @@ export default function LabelOverlay({ svg, meta, onMove, onReset }) {
               key={p.i}
               className={cls}
               style={{ left, top }}
-              title={`${p.name} — drag or arrow-key to move, double-click to reset`}
               onPointerDown={(e) => startDrag(e, p)}
               onClick={(e) => { e.stopPropagation(); setSelected(p.i); }}
               onDoubleClick={() => onReset(p.i)}
             >
-              <span className="dot" />
-              <span className="tag">{p.name}</span>
+              {live
+                ? <span className="dragghost">{p.name}</span>
+                : (
+                  <span className="movearrow" aria-label="move label">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
+                      stroke="currentColor" strokeWidth="2"
+                      strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="12" y1="4" x2="12" y2="20" />
+                      <line x1="4" y1="12" x2="20" y2="12" />
+                      <polyline points="9,7 12,4 15,7" />
+                      <polyline points="9,17 12,20 15,17" />
+                      <polyline points="7,9 4,12 7,15" />
+                      <polyline points="17,9 20,12 17,15" />
+                    </svg>
+                  </span>
+                )}
             </div>
           );
         })}
-      </div>
-      {selected != null && (
+      </div>}
+      {showHandles && selected != null && (
         <div className="nudgehint">Arrow keys nudge · Shift = 10px · dbl-click resets</div>
       )}
     </div>

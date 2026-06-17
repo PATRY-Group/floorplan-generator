@@ -1,4 +1,4 @@
-import React, { useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { uploadPlate } from "./api.js";
 
 const clamp01 = (v) => Math.max(0, Math.min(1, v));
@@ -37,6 +37,23 @@ export default function KeyPlanPanel({ onChange }) {
     setOn(v);
     emit({ on: v });
   }
+
+  // Paste an image from the clipboard (Ctrl/Cmd+V) while the panel is open.
+  useEffect(() => {
+    if (!on) return;
+    function onPaste(e) {
+      const item = [...(e.clipboardData?.items || [])]
+        .find((it) => it.type.startsWith("image/"));
+      if (!item) return;
+      const blob = item.getAsFile();
+      if (!blob) return;
+      e.preventDefault();
+      const ext = (blob.type.split("/")[1] || "png").replace("jpeg", "jpg");
+      choose(new File([blob], `pasted.${ext}`, { type: blob.type }));
+    }
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [on]);
 
   async function choose(file) {
     if (!file) return;
@@ -88,22 +105,19 @@ export default function KeyPlanPanel({ onChange }) {
 
   return (
     <div className="step">
-      <h3>
-        <span className="num">5</span> Key plan
-        <label className="toggle" style={{ marginLeft: "auto" }}>
-          <input type="checkbox" checked={on} onChange={(e) => toggle(e.target.checked)} />
-          add
-        </label>
-      </h3>
+      <label className="toggle" style={{ marginBottom: on ? 10 : 0 }}>
+        <input type="checkbox" checked={on} onChange={(e) => toggle(e.target.checked)} />
+        Add a key plan to this sheet
+      </label>
 
       {on && (
         <>
           <p className="subtle" style={{ marginTop: 0 }}>
-            Upload a floor-plate screenshot, then drag a box over this unit.
-            Schematic only — approximate is fine.
+            Upload or paste a floor-plate screenshot, then drag a box over this
+            unit. Schematic only — approximate is fine.
           </p>
           <label className="drop small">
-            {busy ? "Uploading…" : (plate ? "Replace plate image" : "Choose a plate image (PNG/JPG)")}
+            {busy ? "Uploading…" : (plate ? "Replace plate image" : "Choose or paste an image (Ctrl+V)")}
             <input type="file" accept="image/*" onChange={(e) => choose(e.target.files[0])} />
           </label>
 

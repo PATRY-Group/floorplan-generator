@@ -45,6 +45,15 @@ export async function uploadPlate(file) {
   return data;
 }
 
+export async function extractBrand(file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  const r = await fetch(BASE + "/extract-brand", { method: "POST", body: fd });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.detail || "Brand extraction failed");
+  return data;
+}
+
 export async function saveProperty(id, data) {
   const r = await fetch(BASE + `/properties/${id}`, {
     method: "PUT",
@@ -54,6 +63,13 @@ export async function saveProperty(id, data) {
   const out = await r.json();
   if (!r.ok) throw new Error(out.detail || "Save failed");
   return out;
+}
+
+export async function deleteProperty(id) {
+  const r = await fetch(BASE + `/properties/${id}`, { method: "DELETE" });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.detail || "Delete failed");
+  return data;
 }
 
 export async function listSheets(propertyId) {
