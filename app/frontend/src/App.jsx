@@ -279,6 +279,8 @@ export default function App() {
     patchActive((d) => ({ rooms: d.rooms.map((r, j) => (j === i ? { ...r, ...p } : r)) }));
   const moveLabel = (i, x, y) => updateRoom(i, { x, y });
   const resetLabel = (i) => updateRoom(i, { x: null, y: null });
+  const revertLabels = () =>
+    patchActive((d) => ({ rooms: d.rooms.map((r) => ({ ...r, x: null, y: null })) }));
   function removeRoom(i) {
     patchActive((d) => {
       const room = d.rooms[i];
@@ -591,13 +593,19 @@ export default function App() {
                 {rendering ? <span className="spin">rendering…</span>
                   : active.renderError ? <span style={{ color: "#8a3d28" }}>{active.renderError}</span>
                   : active.showHandles
-                    ? "Live preview — drag to move a label, double-click to reset. Click “Clean view” to hide edit icons."
-                    : "Clean view — edit icons hidden. Click “Edit labels” to move labels again."}
+                    ? "Live preview — drag to move a label, double-click to reset. Click “Hide labels” to hide the edit icons."
+                    : "Labels hidden. Click “Show labels” to move labels again."}
               </span>
               <div className="actions-right">
+                <button className="btn ghost"
+                  disabled={!active.rooms.some((r) => r.x != null && r.y != null)}
+                  onClick={revertLabels}
+                  title="Move every label back to its automatic position">
+                  Revert
+                </button>
                 <button className="btn ghost" onClick={() => patchActive((d) => ({ showHandles: !d.showHandles }))}
                   title="Hide the move handles to see the final sheet">
-                  {active.showHandles ? "Clean view" : "Edit labels"}
+                  {active.showHandles ? "Hide labels" : "Show labels"}
                 </button>
                 <button className="btn ghost icon" disabled={rendering} onClick={() => doRender(false)}
                   title="Reload — re-render the preview (e.g. after editing the property's brand)">

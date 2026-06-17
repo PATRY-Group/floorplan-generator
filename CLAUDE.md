@@ -30,10 +30,11 @@ npm run build                   # production bundle
 
 Open http://localhost:5173. The Vite dev server proxies `/api/*` to the backend (see `vite.config.js`), so the frontend calls same-origin `/api` and there is no CORS config to manage. Point at a different backend with `VITE_API_BASE`.
 
-There is **no test suite** and no linter configured. There is no git repository here.
+There is **no test suite** and no linter configured. The repo is under git; only the prototype scripts and the `app/` tree are tracked source.
 
 ### Environment dependencies
-- **Cairo** (native) is required by `cairosvg` for PNG output. On Windows the GTK runtime ships it; `render.py::_register_cairo_dll_dir()` auto-registers the GTK `bin` dir on `PATH`/`CAIROCFFI_DLL_DIRECTORIES` at import, so PNG works regardless of launching shell. If PNG fails with a DLL error, install the GTK3 runtime.
+- **PNG output** uses `resvg-py` (not `cairosvg`) so uploaded brand fonts embed in the raster — `cairosvg` can't embed arbitrary fonts. Cairo/GTK is still a transitive concern: `render.py::_register_cairo_dll_dir()` auto-registers the GTK `bin` dir on `PATH`/`CAIROCFFI_DLL_DIRECTORIES` at import. If PNG fails with a DLL error, install the GTK3 runtime.
+- **Fonts** uploaded with a property are embedded in the PNG; `fonttools` reads the family name at upload. Brand-file *font names* surfaced by extraction (PDF only, via `PyMuPDF`) are hints to copy — never auto-wired into the serif/sans stacks, since they aren't CSS stacks and aren't installed server-side (the PNG would silently fall back).
 - **DWG support** is optional and requires the **ODA File Converter** CLI. Set the `ODA_CONVERTER` env var to its path (or have it on `PATH`). Without it, only DXF is accepted; `/capabilities` reports this and the UI hides DWG.
 
 ## Architecture
@@ -54,6 +55,8 @@ metadata + key-plan form             /properties, /sheets/*   CRUD + library
 - `engine/parse.py` — DXF → `prims` (flat geometry) + auto-seeded `labels` + `ignored_text` + metadata `suggestions`. Raises `ParseError` for sheet exports / empty geometry.
 - `engine/render.py` — `render(prims, config) -> (svg, png, meta)`. The core.
 - `engine/keyplan.py` — schematic "where's my unit" plate: `keyplan_group()` (footer mini-plate) and `render_keyplan_sheet()` (standalone page).
+- `engine/keyplan_trace.py` — auto-trace a raw plate screenshot into a clean filled footprint silhouette (numpy + PIL): `trace_plate()` caches a palette-independent mask; `colorize()` applies the brand palette at render time. "Seal strength" closes doorway gaps; falls back to dimmed-screenshot mode when a plate won't trace cleanly.
+- `engine/brand.py` — `extract_brand()` pulls a color palette (and PDF-embedded font names) from an uploaded brand file to auto-fill the property-setup form. `dark`/`light` are dependable; `accent`/`mid` are guesses, so all dominant swatches are returned for the user to re-pick.
 - `engine/convert.py` — DWG→DXF via ODA CLI; degrades gracefully when absent.
 - `data/properties/*.json` — one file per property (brand + layer map); `800-princess.json` is the worked example. `data/uploads/` — transient parse/plate cache. `data/sheets/<prop>/` — saved sheet library.
 
