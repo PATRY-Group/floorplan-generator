@@ -61,23 +61,33 @@ def _north_arrow(cx, cy, r, deg, dark, accent):
 
 
 def keyplan_group(plate_bytes, box, ox, oy, w, h, palette,
-                  north_deg=0, with_north=True, with_border=True):
+                  north_deg=0, with_north=True, with_border=True,
+                  silhouette=None):
     """
-    SVG fragment: the plate image in box (ox,oy,w,h), lightened, with the unit
-    cell shaded in accent. `box` = [fx, fy, fw, fh] as fractions of the image
-    (None -> no shaded cell yet).
+    SVG fragment: a plate diagram in box (ox,oy,w,h) with the unit cell shaded
+    in accent. `box` = [fx, fy, fw, fh] as fractions of the image (None -> no
+    shaded cell yet).
+
+    Two looks share the same frame (so box fractions map identically):
+      - silhouette given -> the auto-traced footprint (already brand-coloured,
+        transparent background) drawn opaque: the clean "basic key plan" look.
+      - silhouette None   -> the raw screenshot embedded lightened to 50%.
     """
     dark = palette.get("dark", "#2B1F14")
     accent = palette.get("accent", "#C17F3A")
-    uri = _data_uri(plate_bytes)
     parts = []
     if with_border:
         parts.append(f'<rect x="{ox:.1f}" y="{oy:.1f}" width="{w:.1f}" '
                      f'height="{h:.1f}" fill="#FFFFFF" stroke="{dark}" '
                      f'stroke-width="1.1"/>')
-    parts.append(f'<image href="{uri}" x="{ox:.1f}" y="{oy:.1f}" '
-                 f'width="{w:.1f}" height="{h:.1f}" opacity="0.5" '
-                 f'preserveAspectRatio="none"/>')
+    if silhouette is not None:
+        parts.append(f'<image href="{_data_uri(silhouette)}" x="{ox:.1f}" '
+                     f'y="{oy:.1f}" width="{w:.1f}" height="{h:.1f}" '
+                     f'preserveAspectRatio="none"/>')
+    else:
+        parts.append(f'<image href="{_data_uri(plate_bytes)}" x="{ox:.1f}" '
+                     f'y="{oy:.1f}" width="{w:.1f}" height="{h:.1f}" '
+                     f'opacity="0.5" preserveAspectRatio="none"/>')
     if box and len(box) == 4:
         fx, fy, fw, fh = box
         rx = ox + fx * w
@@ -125,7 +135,8 @@ def render_keyplan_sheet(config):
     ox = (PAGE_W - pw) / 2
     oy = HEADER_H + (PAGE_H - HEADER_H - FOOTER_H - ph) / 2
     group = keyplan_group(plate, kp.get("box"), ox, oy, pw, ph, palette,
-                          north_deg=kp.get("north_deg", 0))
+                          north_deg=kp.get("north_deg", 0),
+                          silhouette=kp.get("silhouette_bytes"))
 
     return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {PAGE_W} {PAGE_H}" font-family="{sans}">
   <rect width="{PAGE_W}" height="{PAGE_H}" fill="{light}"/>

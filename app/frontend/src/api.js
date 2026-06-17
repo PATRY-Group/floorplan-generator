@@ -45,12 +45,32 @@ export async function uploadPlate(file) {
   return data;
 }
 
+export async function tracePlate(plateId, seal, palette) {
+  const r = await fetch(BASE + "/plate/trace", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ plate_id: plateId, seal, palette }),
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.detail || "Trace failed");
+  return data;
+}
+
 export async function extractBrand(file) {
   const fd = new FormData();
   fd.append("file", file);
   const r = await fetch(BASE + "/extract-brand", { method: "POST", body: fd });
   const data = await r.json();
   if (!r.ok) throw new Error(data.detail || "Brand extraction failed");
+  return data;
+}
+
+export async function fontInfo(file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  const r = await fetch(BASE + "/font-info", { method: "POST", body: fd });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.detail || "Font read failed");
   return data;
 }
 

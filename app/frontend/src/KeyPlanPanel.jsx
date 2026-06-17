@@ -1,25 +1,39 @@
 import React, { useEffect, useRef, useState } from "react";
-import { uploadPlate } from "./api.js";
+import { uploadPlate, tracePlate } from "./api.js";
 
 const clamp01 = (v) => Math.max(0, Math.min(1, v));
 
 /**
  * Optional key-plan controls: upload a floor-plate screenshot, drag a box over
  * the unit's location, pick a floor label and footer/standalone placement.
+ *
+ * Two looks for the plate:
+ *   - "traced"  -> the app auto-traces the screenshot into a clean filled
+ *                  footprint silhouette (the "basic key plan" look). A seal-
+ *                  strength slider tunes how aggressively wall gaps are closed.
+ *   - "raw"     -> the original screenshot embedded lightened (fallback when a
+ *                  busy/odd plate won't trace cleanly).
+ * The box-placement picker always shows the RAW screenshot — you need the
+ * interior walls to find the unit — and the box fraction maps onto either look.
+ *
  * Calls onChange(keyplanConfig | null) whenever the config is complete.
  */
-export default function KeyPlanPanel({ onChange }) {
+export default function KeyPlanPanel({ onChange, palette }) {
   const [on, setOn] = useState(false);
   const [plate, setPlate] = useState(null);   // {plate_id, url}
   const [box, setBox] = useState(null);        // [fx, fy, fw, fh]
   const [floor, setFloor] = useState("");
   const [placement, setPlacement] = useState("footer");
+  const [mode, setMode] = useState("traced");  // "traced" | "raw"
+  const [seal, setSeal] = useState(35);
+  const [trace, setTrace] = useState(null);    // {preview, coverage}
+  const [tracing, setTracing] = useState(false);
   const [drag, setDrag] = useState(null);
   const [busy, setBusy] = useState(false);
   const imgRef = useRef(null);
 
   function emit(next) {
-    const s = { on, plate, box, floor, placement, ...next };
+    const s = { on, plate, box, floor, placement, mode, seal, ...next };
     if (s.on && s.plate && s.box) {
       onChange({
         plate_id: s.plate.plate_id,
@@ -27,6 +41,8 @@ export default function KeyPlanPanel({ onChange }) {
         floor_label: s.floor,
         placement: s.placement,
         north_deg: 0,
+        mode: s.mode,
+        seal: s.seal,
       });
     } else {
       onChange(null);
@@ -54,6 +70,24 @@ export default function KeyPlanPanel({ onChange }) {
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
   }, [on]);
+
+  // Auto-trace the plate into a footprint silhouette (debounced for the slider).
+  useEffect(() => {
+    if (!on || !plate || mode !== "traced") { setTrace(null); return; }
+    let cancelled = false;
+    setTracing(true);
+    const t = setTimeout(async () => {
+      try {
+        const r = await tracePlate(plate.plate_id, seal, palette);
+        if (!cancelled) setTrace(r);
+      } catch {
+        if (!cancelled) setTrace(null);
+      } finally {
+        if (!cancelled) setTracing(false);
+      }
+    }, 300);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [on, plate, mode, seal, palette]);
 
   async function choose(file) {
     if (!file) return;
@@ -103,6 +137,11 @@ export default function KeyPlanPanel({ onChange }) {
        Math.abs(drag.x1 - drag.x0), Math.abs(drag.y1 - drag.y0)]
     : box;
 
+  // A coverage well outside this band means the trace missed (caught only walls)
+  // or over-sealed (bridged into neighbours) — nudge the user to adjust/fallback.
+  const cov = trace && typeof trace.coverage === "number" ? trace.coverage : null;
+  const covWarn = cov !== null && (cov < 0.08 || cov > 0.92);
+
   return (
     <div className="step">
       <label className="toggle" style={{ marginBottom: on ? 10 : 0 }}>
@@ -122,22 +161,71 @@ export default function KeyPlanPanel({ onChange }) {
           </label>
 
           {plate && (
-            <div
-              className="platepick"
-              ref={imgRef}
-              onPointerDown={down}
-              onPointerMove={move}
-              onPointerUp={up}
-              onPointerLeave={up}
-            >
-              <img src={plate.url} alt="floor plate" draggable={false} />
-              {live && (
-                <div className="platebox" style={{
-                  left: `${live[0] * 100}%`, top: `${live[1] * 100}%`,
-                  width: `${live[2] * 100}%`, height: `${live[3] * 100}%`,
-                }} />
+            <>
+              <label>Look</label>
+              <div className="btnrow">
+                {[["traced", "Auto-traced plan"], ["raw", "Screenshot"]].map(([m, lbl]) => (
+                  <button key={m}
+                    className={"btn " + (mode === m ? "ember" : "ghost")}
+                    onClick={() => { setMode(m); emit({ mode: m }); }}>
+                    {lbl}
+                  </button>
+                ))}
+              </div>
+
+              {mode === "traced" && (
+                <>
+                  <label>
+                    Seal strength {tracing ? "· tracing…" : ""}
+                  </label>
+                  <input type="range" min="7" max="61" step="2" value={seal}
+                    style={{ width: "100%" }}
+                    onChange={(e) => { const v = +e.target.value; setSeal(v); emit({ seal: v }); }} />
+                  <p className="subtle" style={{ marginTop: 2 }}>
+                    Lower keeps detail; higher closes wall gaps so the floor fills
+                    in. {trace && trace.preview && (
+                      <span>If the shape looks wrong, adjust this or switch to
+                      Screenshot.</span>
+                    )}
+                  </p>
+                  {trace && trace.preview && (
+                    <div className="platepick" style={{ marginTop: 6 }}>
+                      <img src={trace.preview} alt="traced footprint"
+                        draggable={false}
+                        style={{ background: "#F7F3ED" }} />
+                    </div>
+                  )}
+                  {covWarn && (
+                    <p className="subtle" style={{ color: "#b4571f" }}>
+                      The auto-trace looks off on this plate — try the slider, or
+                      switch to Screenshot.
+                    </p>
+                  )}
+                </>
               )}
-            </div>
+            </>
+          )}
+
+          {plate && (
+            <>
+              <label>Unit location</label>
+              <div
+                className="platepick"
+                ref={imgRef}
+                onPointerDown={down}
+                onPointerMove={move}
+                onPointerUp={up}
+                onPointerLeave={up}
+              >
+                <img src={plate.url} alt="floor plate" draggable={false} />
+                {live && (
+                  <div className="platebox" style={{
+                    left: `${live[0] * 100}%`, top: `${live[1] * 100}%`,
+                    width: `${live[2] * 100}%`, height: `${live[3] * 100}%`,
+                  }} />
+                )}
+              </div>
+            </>
           )}
 
           {plate && !box && (

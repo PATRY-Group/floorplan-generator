@@ -119,9 +119,6 @@ export default function LabelOverlay({ svg, meta, onMove, onReset, showHandles =
           );
         })}
       </div>}
-      {showHandles && selected != null && (
-        <div className="nudgehint">Arrow keys nudge · Shift = 10px · dbl-click resets</div>
-      )}
     </div>
   );
 }

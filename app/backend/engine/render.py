@@ -77,6 +77,24 @@ def _text_w(s, size, ls):
     return 0.70 * size * len(s) + ls * (len(s) - 1) + 6
 
 
+def _glyph_width(font_data_uri, s, size, ls):
+    """Exact pixel width of `s` from an embedded font's own advance widths, so
+    header spacing adapts to whatever font is in use instead of a fixed guess."""
+    import base64
+    import io as _io
+    from fontTools.ttLib import TTFont
+    raw = base64.b64decode(font_data_uri.split(",", 1)[1])
+    f = TTFont(_io.BytesIO(raw), fontNumber=0)
+    upm = f["head"].unitsPerEm or 1000
+    cmap = f.getBestCmap()
+    hmtx = f["hmtx"]
+    total = 0.0
+    for ch in s:
+        gn = cmap.get(ord(ch))
+        total += (hmtx[gn][0] if gn and gn in hmtx.metrics else upm * 0.6)
+    return total / upm * size + ls * max(len(s) - 1, 0) + 6
+
+
 def _role_lookup(layer_map):
     out = {}
     for role, layers in layer_map.items():
@@ -291,7 +309,18 @@ def render(prims, config):
     elif sf:
         sub_line = sf
     lockup_x = 60
-    divider_x = lockup_x + 12 + _text_w(lockup, 44, 0)
+    # Measure the lockup in its actual font when we have the file, so the
+    # divider/name spacing adapts to the font instead of a fixed-width guess.
+    _disp = next((f for f in (config.get("font_faces") or [])
+                  if f.get("data") and (f.get("role") == "serif" or f.get("family") == SERIF)), None)
+    if _disp:
+        try:
+            lockup_w = _glyph_width(_disp["data"], lockup, 44, 0)
+        except Exception:
+            lockup_w = _text_w(lockup, 44, 0)
+    else:
+        lockup_w = _text_w(lockup, 44, 0)
+    divider_x = lockup_x + 12 + lockup_w
     name_x = divider_x + 20
 
     # ---- optional footer key-plan mini-plate -------------------------------
@@ -307,7 +336,8 @@ def render(prims, config):
         kp_oy = (PAGE_H - FOOTER_H) + (FOOTER_H - kp_h) / 2 - 8
         footer_kp_svg = keyplan_group(keyplan["plate_bytes"], keyplan.get("box"),
                                       kp_ox, kp_oy, kp_w, kp_h, palette,
-                                      north_deg=keyplan.get("north_deg", 0))
+                                      north_deg=keyplan.get("north_deg", 0),
+                                      silhouette=keyplan.get("silhouette_bytes"))
         addr_x = kp_ox - 24
         fl = esc((keyplan.get("floor_label") or "").upper())
         kp_cx = kp_ox + kp_w / 2
