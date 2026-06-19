@@ -10,11 +10,13 @@ const exportName = (propId, title, suffix = "") => {
 };
 
 // Unified saved-sheet library across all properties: filter by property,
-// search, thumbnails, downloads, re-open, delete. Each sheet carries its own
-// property_id / property_name (from GET /sheets).
-export default function Library({ sheets, onReopen, onDelete }) {
+// search, thumbnails, downloads, rename, re-open, delete. Each sheet carries
+// its own property_id / property_name (from GET /sheets).
+export default function Library({ sheets, onReopen, onDelete, onRename }) {
   const [q, setQ] = useState("");
   const [prop, setProp] = useState("");        // "" = all properties
+  const [editing, setEditing] = useState(null); // sheet_id being renamed
+  const [draft, setDraft] = useState("");
 
   // distinct properties present, for the filter chips
   const props = [];
@@ -33,6 +35,16 @@ export default function Library({ sheets, onReopen, onDelete }) {
     if (!query) return true;
     return `${s.title} ${s.suite} ${s.sf} ${s.property_name}`.toLowerCase().includes(query);
   });
+
+  function startRename(s) {
+    setEditing(s.sheet_id);
+    setDraft(s.title || "");
+  }
+  function commitRename(s) {
+    const next = draft.trim();
+    setEditing(null);
+    if (next && next !== s.title) onRename(s, next);
+  }
 
   return (
     <div className="library">
@@ -73,10 +85,23 @@ export default function Library({ sheets, onReopen, onDelete }) {
             </a>
             <div className="cap">
               <div className="libprop">{s.property_name || s.property_id}</div>
-              <div className="capttl">
-                {s.title ? exportName(s.property_id, s.title) : "Untitled"}
-                {s.keyplan && <span className="kpbadge">KEY PLAN</span>}
-              </div>
+              {editing === s.sheet_id ? (
+                <input className="librename" autoFocus value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  onBlur={() => commitRename(s)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitRename(s);
+                    if (e.key === "Escape") setEditing(null);
+                  }} />
+              ) : (
+                <div className="capttl" title="Double-click to rename"
+                  onDoubleClick={() => startRename(s)}>
+                  {s.title ? exportName(s.property_id, s.title) : "Untitled"}
+                  <button className="renamepen" title="Rename"
+                    onClick={() => startRename(s)}>✎</button>
+                  {s.keyplan && <span className="kpbadge">KEY PLAN</span>}
+                </div>
+              )}
               <div className="capsub">{[s.suite, s.sf, s.created].filter(Boolean).join(" · ")}</div>
               <div className="libactions">
                 <a href={sheetUrl(s.property_id, s.sheet_id, "svg") + bust} target="_blank" rel="noreferrer"

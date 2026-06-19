@@ -88,6 +88,15 @@ export async function listAllSheets() {
   return jget("/sheets");
 }
 
+export async function renameSheet(propertyId, sheetId, title) {
+  const r = await fetch(BASE + `/sheets/${propertyId}/${sheetId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title }),
+  });
+  return handle(r, "Rename failed");
+}
+
 export function sheetUrl(propertyId, sheetId, ext) {
   return `${BASE}/sheets/${propertyId}/${sheetId}.${ext}`;
 }

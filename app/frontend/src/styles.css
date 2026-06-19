@@ -420,6 +420,12 @@ select, input[type="text"] {
 .capttl { font-size: 12px; color: var(--ink); font-weight: 600; display: flex; align-items: center; gap: 6px; }
 .capsub { margin: 2px 0 6px; }
 .kpbadge { background: var(--ember); color: #fff; font-size: 8px; font-weight: 700; letter-spacing: 0.5px; padding: 1px 5px; border-radius: 8px; }
+.renamepen {
+  border: none; background: none; cursor: pointer; padding: 0 2px; line-height: 1;
+  font-size: 11px; color: var(--muted, #999); opacity: 0; transition: opacity 0.12s;
+}
+.libcard:hover .renamepen { opacity: 0.7; }
+.renamepen:hover { opacity: 1; color: var(--ember); }
 .libactions { display: flex; flex-wrap: wrap; gap: 5px; }
 .libactions a, .libactions button {
   font-size: 10.5px; padding: 3px 7px; border-radius: 4px; border: 1px solid var(--line);
@@ -439,6 +445,10 @@ select, input[type="text"] {
 .libchip.on { background: var(--charcoal); color: var(--chalk); border-color: var(--charcoal); }
 /* per-card property name + inline rename field */
 .libprop { font-size: 9.5px; letter-spacing: 1px; text-transform: uppercase; color: var(--ember); margin-bottom: 2px; }
+.librename {
+  width: 100%; font-size: 12px; font-weight: 600; color: var(--ink);
+  padding: 2px 5px; border: 1px solid var(--ember); border-radius: 4px; margin-bottom: 2px;
+}
 
 /* ---- selected label handle + nudge hint ---- */
 .handle.selected .movearrow { box-shadow: 0 0 0 3px rgba(193, 127, 58, 0.5), 0 1px 3px rgba(0, 0, 0, 0.25); }

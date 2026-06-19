@@ -10,6 +10,7 @@ Floor Plan Sheet Generator — backend service.
   GET  /sheets                        unified library: all sheets, all properties
   GET  /sheets/{prop}                 saved sheets for one property
   GET  /sheets/{prop}/{id}.svg|.png   download a saved sheet
+  PATCH /sheets/{prop}/{id}           rename a saved sheet (library label)
   POST /sheets/{prop}/{id}/reopen     re-register geometry to keep editing
   DELETE /sheets/{prop}/{id}          remove a saved sheet
   GET  /capabilities                  feature/runtime flags
@@ -545,6 +546,36 @@ def list_all_sheets():
 def list_sheets(prop_id):
     _safe_id(prop_id, "property id")
     return _read_index(prop_id)
+
+
+class RenameRequest(BaseModel):
+    title: str
+
+
+@app.patch("/sheets/{prop_id}/{sheet_id}")
+def rename_sheet(prop_id, sheet_id, req: RenameRequest):
+    """Relabel a saved sheet in the library (and in its config, so a re-open
+    carries the new title). The already-exported SVG/PNG are left untouched —
+    the printed title updates only on the next re-open + re-save."""
+    _safe_id(prop_id, "property id")
+    _safe_id(sheet_id, "sheet id")
+    d = os.path.join(SHEET_DIR, prop_id)
+    title = req.title.strip()
+    index = os.path.join(d, "index.json")
+    if not os.path.isfile(index):
+        raise HTTPException(status_code=404, detail="Sheet not found.")
+    sheets = _read_json(index, [])
+    entry = next((s for s in sheets if s.get("sheet_id") == sheet_id), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Sheet not found.")
+    entry["title"] = title
+    _write_json(index, sheets, indent=2, ensure_ascii=False)
+    cfg_path = os.path.join(d, f"{sheet_id}.config.json")
+    if os.path.isfile(cfg_path):
+        cfg = _read_json(cfg_path, {})
+        cfg.setdefault("metadata", {})["title"] = title
+        _write_json(cfg_path, cfg, ensure_ascii=False)
+    return {"sheet_id": sheet_id, "title": title}
 
 
 @app.get("/sheets/{prop_id}/{sheet_id}.svg")

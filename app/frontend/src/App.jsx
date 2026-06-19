@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
   getCapabilities, listProperties, parseFile, renderSheet,
-  listAllSheets, reopenSheet, deleteSheet,
+  listAllSheets, reopenSheet, deleteSheet, renameSheet,
 } from "./api.js";
 import LabelOverlay from "./LabelOverlay.jsx";
 import PropertySetup from "./PropertySetup.jsx";
@@ -416,6 +416,27 @@ export default function App() {
       toast(e.message, "error");
     }
   }
+  async function renameSheetAction(s, title) {
+    const next = (title || "").trim();
+    if (!next || next === s.title) return;
+    const prev = s.title;
+    const prop = s.property_id || propertyId;
+    // optimistic; offer an undo back to the previous title
+    setSheets((xs) => xs.map((x) => (x.sheet_id === s.sheet_id ? { ...x, title: next } : x)));
+    try {
+      await renameSheet(prop, s.sheet_id, next);
+      toast(`Renamed to "${next}"`, "success", {
+        label: "Undo",
+        run: async () => {
+          setSheets((xs) => xs.map((x) => (x.sheet_id === s.sheet_id ? { ...x, title: prev } : x)));
+          try { await renameSheet(prop, s.sheet_id, prev); } catch (e) { toast(e.message, "error"); }
+        },
+      });
+    } catch (e) {
+      setSheets((xs) => xs.map((x) => (x.sheet_id === s.sheet_id ? { ...x, title: prev } : x)));
+      toast(e.message, "error");
+    }
+  }
 
   // ---- sidebar resize ------------------------------------------------------
   function startResize(e) {
@@ -643,7 +664,7 @@ export default function App() {
 
         {activeId === "library" ? (
           <Library sheets={sheets}
-            onReopen={reopen} onDelete={removeSheet} />
+            onReopen={reopen} onDelete={removeSheet} onRename={renameSheetAction} />
         ) : !ready ? (
           <div className="placeholder">
             <div className="big">▭</div>
