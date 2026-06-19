@@ -402,6 +402,33 @@ export default function App() {
       setPngBusy(false);
     }
   }
+  // Bare line drawing — no header/footer/watermark. kind: "svg" | "png".
+  async function downloadPlanOnly(kind) {
+    const d = docs.find((x) => x.id === activeId);
+    if (!d || !d.docId) return;
+    setPngBusy(true);
+    try {
+      const res = await renderSheet({
+        doc_id: d.docId, property_id: d.propertyId || null,
+        metadata: d.meta, rooms: d.rooms, plan_only: true, want_png: kind === "png",
+      });
+      const a = document.createElement("a");
+      if (kind === "png") {
+        if (!res.png_b64) throw new Error("No PNG returned by the server.");
+        a.href = "data:image/png;base64," + res.png_b64;
+      } else {
+        const blob = new Blob([res.svg], { type: "image/svg+xml" });
+        a.href = URL.createObjectURL(blob);
+      }
+      a.download = `${exportName(d.propertyId, d.meta.title, "-plan")}.${kind}`;
+      a.click();
+      if (kind !== "png") URL.revokeObjectURL(a.href);
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      setPngBusy(false);
+    }
+  }
 
   // ---- library actions -----------------------------------------------------
   async function reopen(s) {
@@ -753,6 +780,16 @@ export default function App() {
                         <button disabled={pngBusy}
                           onClick={() => { setDlOpen(false); downloadCurrentSvg(); downloadCurrentPng(); }}>
                           SVG + PNG
+                        </button>
+                        <div className="menu-sep" />
+                        <div className="menu-label">Plan only — no branding</div>
+                        <button disabled={pngBusy}
+                          onClick={() => { setDlOpen(false); downloadPlanOnly("svg"); }}>
+                          Plan SVG
+                        </button>
+                        <button disabled={pngBusy}
+                          onClick={() => { setDlOpen(false); downloadPlanOnly("png"); }}>
+                          Plan PNG
                         </button>
                       </div>
                     </>

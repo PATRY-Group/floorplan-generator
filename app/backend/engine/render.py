@@ -272,6 +272,51 @@ def render(prims, config):
         return "\n".join(f'<polyline points="{_pts_attr(p)}" {style}/>'
                          for p in lines if len(p) >= 2)
 
+    # ---- "plan only" export: just the line drawing -------------------------
+    # The bare floor plan (walls/poché/doors/glazing in WALL ink + room labels),
+    # cropped tight with a transparent background — no header, footer, watermark
+    # or key-plan chrome. Default output is unaffected; this is a separate path.
+    if config.get("plan_only"):
+        geom = (
+            '<g stroke-linecap="round" stroke-linejoin="round" fill="none">\n'
+            f'<path d="{" ".join(wall_fills)}" fill="{WALL}" stroke="none" fill-rule="nonzero"/>\n'
+            + polyline_group(wall_lines, f'stroke="{WALL}" stroke-width="1.6"') + "\n"
+            + polyline_group(glaz_lines, f'stroke="{WALL}" stroke-width="0.9"') + "\n"
+            + polyline_group(door_lines, f'stroke="{WALL}" stroke-width="1.0"') + "\n"
+            + polyline_group(swing_lines, f'stroke="{WALL}" stroke-width="0.7" stroke-opacity="0.45"') + "\n"
+            + polyline_group(thin_lines, f'stroke="{WALL}" stroke-width="0.6" stroke-opacity="0.55"') + "\n"
+            + polyline_group(dash_lines, f'stroke="{WALL}" stroke-width="0.6" stroke-opacity="0.35" stroke-dasharray="4 3"') + "\n"
+            "</g>"
+        )
+        labels = "\n".join(room_labels)
+        # crop to the plan bounds, expanded to include any labels placed at the edge
+        x0, x1 = X(minx), X(maxx)
+        y0, y1 = Y(maxy), Y(miny)
+        for p in placements:
+            x0 = min(x0, p["px"] - p["bw"] / 2); x1 = max(x1, p["px"] + p["bw"] / 2)
+            y0 = min(y0, p["py"] - p["bh"] / 2); y1 = max(y1, p["py"] + p["bh"] / 2)
+        # generous margin so the exported asset has breathing room on every
+        # edge — scales with the plan size, with a sensible floor
+        pad = max(64.0, 0.10 * max(x1 - x0, y1 - y0))
+        vbx, vby = x0 - pad, y0 - pad
+        vbw, vbh = (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad
+        bare = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'viewBox="{vbx:.1f} {vby:.1f} {vbw:.1f} {vbh:.1f}" font-family="{SANS}">\n'
+            f'<rect x="{vbx:.1f}" y="{vby:.1f}" width="{vbw:.1f}" height="{vbh:.1f}" fill="#FFFFFF"/>\n'
+            f'{geom}\n{labels}\n</svg>'
+        )
+        out_w = min(2400, max(1000, round(vbw * 2)))
+        png_bytes = cairosvg.svg2png(bytestring=bare.encode("utf-8"), output_width=out_w)
+        meta = {
+            "transform": {"tx": round(tx, 4), "ty": round(ty, 4), "s": round(s, 6)},
+            "page": {"w": round(vbw, 1), "h": round(vbh, 1)},
+            "extents": {"minx": minx, "maxx": maxx, "miny": miny, "maxy": maxy},
+            "placements": placements,
+            "plan_only": True,
+        }
+        return bare, png_bytes, meta
+
     title = esc((md.get("title") or "").upper())
     suite = esc(md.get("suite") or "")
     sf = esc(md.get("sf") or "")

@@ -369,6 +369,7 @@ class RenderRequest(BaseModel):
     save: bool = False
     sheet_id: Optional[str] = None   # overwrite this saved sheet instead of minting a new one
     want_png: bool = False   # include base64 PNG in the response (for download)
+    plan_only: bool = False  # bare line drawing — no header/footer/watermark/keyplan
 
 
 def _load_prims(doc_id):
@@ -392,7 +393,8 @@ def do_render(req: RenderRequest):
     prims = _load_prims(req.doc_id)
     prop = load_property(req.property_id) if req.property_id else None
     config = compose_config(prop, req.metadata, req.rooms, req.palette, req.layer_map)
-    if req.keyplan:
+    config["plan_only"] = req.plan_only
+    if req.keyplan and not req.plan_only:
         kp = dict(req.keyplan)
         kp["plate_bytes"] = _plate_bytes(kp.get("plate_id"))
         if kp.get("mode") == "traced" and kp.get("plate_id"):
@@ -408,14 +410,14 @@ def do_render(req: RenderRequest):
     svg, png = _apply_custom_fonts(svg, png, config.get("font_faces"))
 
     keyplan_svg = None
-    if req.keyplan and req.keyplan.get("placement") == "standalone":
+    if req.keyplan and not req.plan_only and req.keyplan.get("placement") == "standalone":
         try:
             keyplan_svg = render_keyplan_sheet(config)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Key plan failed: {exc}")
 
     sheet_id = None
-    if req.save and req.property_id:
+    if req.save and req.property_id and not req.plan_only:
         out = os.path.join(SHEET_DIR, req.property_id)
         os.makedirs(out, exist_ok=True)
         index = os.path.join(out, "index.json")

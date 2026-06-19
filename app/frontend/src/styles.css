@@ -264,6 +264,8 @@ select, input[type="text"] {
 }
 .menu button:hover { background: var(--limestone); }
 .menu button:disabled { opacity: 0.5; cursor: default; }
+.menu-sep { height: 1px; background: var(--line); margin: 4px 0; }
+.menu-label { padding: 6px 14px 2px; font-size: 9.5px; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); }
 
 /* ---- document + library tabs ---- */
 /* Sticky header holding the action row (top) above the tab strip (below). */
