@@ -279,8 +279,22 @@ export default function App() {
     patchActive((d) => ({ rooms: d.rooms.map((r, j) => (j === i ? { ...r, ...p } : r)) }));
   const moveLabel = (i, x, y) => updateRoom(i, { x, y });
   const resetLabel = (i) => updateRoom(i, { x: null, y: null });
-  const revertLabels = () =>
+  function revertLabels() {
+    if (!active) return;
+    const id = active.id;
+    const snapshot = active.rooms.map((r) => ({ x: r.x ?? null, y: r.y ?? null }));
+    const hadOverride = snapshot.some((p) => p.x != null || p.y != null);
     patchActive((d) => ({ rooms: d.rooms.map((r) => ({ ...r, x: null, y: null })) }));
+    if (!hadOverride) return;   // nothing was moved — nothing to undo
+    toast("Reverted label positions", "success", {
+      label: "Undo",
+      run: () => patchDoc(id, (d) => ({
+        rooms: d.rooms.map((r, i) => ({
+          ...r, x: snapshot[i]?.x ?? null, y: snapshot[i]?.y ?? null,
+        })),
+      })),
+    });
+  }
   function removeRoom(i) {
     patchActive((d) => {
       const room = d.rooms[i];
