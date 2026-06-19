@@ -225,16 +225,28 @@ def _trace_mask(plate_id, seal):
     disk (the morphology + BFS are too slow to run per render). Returns the
     grayscale mask PNG bytes and coverage fraction, or (None, 0.0) if no plate."""
     seal = max(7, min(61, int(seal) | 1))   # clamp + force odd
-    cache = os.path.join(UP_DIR, f"{plate_id}_trace{seal}.png")
+    cache = os.path.join(UP_DIR, f"{plate_id}_tracew{seal}.png")
+    covfile = cache + ".cov"
     if os.path.isfile(cache):
+        cov = None   # persisted alongside the mask so a cache hit still reports it
+        try:
+            with open(covfile) as f:
+                cov = float(f.read().strip())
+        except (OSError, ValueError):
+            cov = None   # older cache without a sidecar — coverage unknown
         with open(cache, "rb") as f:
-            return f.read(), None
+            return f.read(), cov
     raw = _plate_bytes(plate_id)
     if not raw:
         return None, 0.0
     mask, cov = trace_plate(raw, seal=seal)
     with open(cache, "wb") as f:
         f.write(mask)
+    try:
+        with open(covfile, "w") as f:
+            f.write(repr(float(cov)))
+    except OSError:
+        pass
     return mask, cov
 
 
