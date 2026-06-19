@@ -20,8 +20,7 @@ import tempfile
 import time
 import unittest
 
-from fastapi import HTTPException
-from starlette.datastructures import UploadFile
+from fastapi import HTTPException, UploadFile
 
 import fixtures as fx
 import main
@@ -165,6 +164,7 @@ class SheetLifecycleTest(_TempDataDirs):
 
         # reopen copies geometry back under a fresh doc_id so editing works
         reopened = reopen_sheet("acme", sid)
+        assert reopened is not None      # reopen of a just-saved sheet succeeds
         new_doc = reopened["doc_id"]
         self.assertNotEqual(new_doc, doc)
         self.assertTrue(os.path.exists(
