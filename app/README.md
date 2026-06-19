@@ -31,26 +31,41 @@ app/
 
 ## Run it
 
-Two processes: the Python backend and the React dev server.
+Two processes that must **both** stay running: the Python backend and the React
+dev server. Use **two separate terminals** and leave each one open — closing a
+terminal (or the session that launched it) stops that server.
 
 ### 1. Backend (port 8000)
 
+**Windows (PowerShell)** — from `app/backend`:
+
+```bash
+cd program/app/backend
+./.venv/Scripts/activate     # venv already exists; create with: python -m venv .venv
+pip install -r requirements.txt # first run only, or when deps change
+uvicorn main:app --reload --port 8000
+```
+
+**macOS / Linux** — from `app/backend`:
+
 ```bash
 cd app/backend
-python3 -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
 `cairosvg` needs the Cairo native library. macOS: `brew install cairo`.
 Debian/Ubuntu: `sudo apt-get install libcairo2`. Windows: it ships with the
-`cairosvg` wheel, or install GTK runtime if you hit a DLL error.
+`cairosvg` wheel, or install the GTK3 runtime if you hit a DLL error.
 
 ### 2. Frontend (port 5173)
 
+In a **second** terminal, from `app/frontend`:
+
 ```bash
-cd app/frontend
-npm install
+cd program/app/frontend
+npm install                     # first run only
 npm run dev
 ```
 
@@ -109,6 +124,17 @@ those if you prefer, modelled on `800-princess.json`.
   point, then refined by the clear-pocket + halo placement. Occasional misses
   are corrected by dragging the label on the preview.
 - `.rvt` is rejected with guidance; export a DXF view from Revit first.
+- **DWG input is auto-converted, but only if the server has the ODA File
+  Converter.** When a `.dwg` is uploaded, `/parse` shells out to `engine/convert.py`,
+  which calls the ODA File Converter CLI to produce a DXF and then parses that DXF
+  exactly like a normal upload — so DWG works end-to-end *only on a server where
+  ODA is installed* (`ODA_CONVERTER` env var, or on `PATH`). The app does **not**
+  bundle ODA. If it's absent, the conversion does not happen and the DWG is
+  rejected with a 422 explaining how to install ODA or convert to DXF yourself;
+  only DXF is accepted, and `/capabilities` reports `dwg_conversion: false` so the
+  UI hides the DWG option. (Either way, the converted file must still be a
+  single-unit Revit *view* with wall geometry — a valid DWG that converts cleanly
+  can still fail at parse if it has no usable geometry.)
 - The rendering output is byte-for-byte the same engine as
   `build_floorplan_sheets.py`; only the inputs are now config-driven.
 - **Large files** are guarded: uploads over 60 MB are rejected, geometry is
