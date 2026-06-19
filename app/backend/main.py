@@ -21,6 +21,7 @@ import glob
 import io
 import json
 import os
+import re
 import shutil
 import time
 import uuid
@@ -77,17 +78,48 @@ def _on_startup():
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
-def load_property(prop_id):
-    path = os.path.join(PROP_DIR, f"{prop_id}.json")
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _safe_id(value, what="id"):
+    """Reject ids that could escape the data dirs via path separators. All ids
+    (property/sheet/plate/doc) are generated as uuid hex or slugs, so a strict
+    allow-list is safe — and on Windows it also blocks the backslash-segment
+    traversal that the default URL path converter would otherwise let through."""
+    if not isinstance(value, str) or not _ID_RE.match(value):
+        raise HTTPException(status_code=400, detail=f"Invalid {what}.")
+    return value
+
+
+def _read_json(path, default=None):
+    """Read a JSON file, returning `default` if it doesn't exist."""
     if not os.path.isfile(path):
-        return None
+        return default
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
+def _write_json(path, data, **dump_kw):
+    """Write JSON atomically: dump to a sibling temp file, then os.replace it
+    into place — so a reader (or a crash mid-write) never sees a truncated file.
+    The replace is atomic on a single filesystem, which all of data/ is."""
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, **dump_kw)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def load_property(prop_id):
+    return _read_json(os.path.join(PROP_DIR, f"{prop_id}.json"))
+
+
 def save_property(prop):
-    with open(os.path.join(PROP_DIR, f"{prop['id']}.json"), "w", encoding="utf-8") as f:
-        json.dump(prop, f, indent=2, ensure_ascii=False)
+    _write_json(os.path.join(PROP_DIR, f"{prop['id']}.json"), prop,
+                indent=2, ensure_ascii=False)
 
 
 def compose_config(prop, metadata, rooms, palette_override=None, layer_map_override=None):
@@ -225,6 +257,8 @@ def health():
 @app.post("/parse")
 async def parse(file: UploadFile = File(...), property_id: Optional[str] = Form(None)):
     sweep_uploads()
+    if property_id:
+        _safe_id(property_id, "property id")
     name = (file.filename or "").lower()
     raw = await file.read()
     if len(raw) > MAX_UPLOAD_MB * 1024 * 1024:
@@ -296,6 +330,7 @@ def trace_plate_preview(req: TraceRequest):
     """Auto-trace a plate into a footprint silhouette and return a coloured
     preview (data URI) + coverage, so the UI can show the result, let the user
     tune seal strength, and fall back to the raw screenshot if it won't trace."""
+    _safe_id(req.plate_id, "plate id")
     mask, cov = _trace_mask(req.plate_id, req.seal)
     if mask is None:
         raise HTTPException(status_code=404, detail="Plate not found or expired.")
@@ -344,6 +379,11 @@ def _load_prims(doc_id):
 
 @app.post("/render")
 def do_render(req: RenderRequest):
+    _safe_id(req.doc_id, "doc id")
+    if req.property_id:
+        _safe_id(req.property_id, "property id")
+    if req.keyplan and req.keyplan.get("plate_id"):
+        _safe_id(req.keyplan["plate_id"], "plate id")
     prims = _load_prims(req.doc_id)
     prop = load_property(req.property_id) if req.property_id else None
     config = compose_config(prop, req.metadata, req.rooms, req.palette, req.layer_map)
@@ -417,6 +457,7 @@ def list_properties():
 
 @app.get("/properties/{prop_id}")
 def get_property(prop_id):
+    _safe_id(prop_id, "property id")
     prop = load_property(prop_id)
     if not prop:
         raise HTTPException(status_code=404, detail="Property not found.")
@@ -442,6 +483,7 @@ class Property(BaseModel):
 
 @app.put("/properties/{prop_id}")
 def put_property(prop_id, prop: Property):
+    _safe_id(prop_id, "property id")
     data = prop.model_dump()
     data["id"] = prop_id
     if not data.get("layer_map"):
@@ -452,6 +494,7 @@ def put_property(prop_id, prop: Property):
 
 @app.delete("/properties/{prop_id}")
 def delete_property(prop_id):
+    _safe_id(prop_id, "property id")
     path = os.path.join(PROP_DIR, f"{prop_id}.json")
     if os.path.isfile(path):
         os.remove(path)
