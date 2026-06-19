@@ -1,4 +1,5 @@
 from .parse import parse_dxf, ParseError, DEFAULT_LAYER_MAP
+from .layers import infer_layer_map
 from .render import render
 from .keyplan import render_keyplan_sheet, keyplan_group
 from .keyplan_trace import trace_plate, colorize as colorize_trace
