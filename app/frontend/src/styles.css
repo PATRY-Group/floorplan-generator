@@ -241,6 +241,15 @@ select, input[type="text"] {
   margin-bottom: 8px;
 }
 .batchqueue-head .subtle { margin: 0; }
+.batchqueue-note {
+  font-size: 12px;
+  line-height: 1.45;
+  background: #fbf3e9;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 10px;
+  margin-bottom: 8px;
+}
 .batchqueue-row {
   display: flex;
   align-items: center;

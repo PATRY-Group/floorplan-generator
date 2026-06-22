@@ -1052,6 +1052,13 @@ export default function App() {
                 </span>
                 <button className="chip" onClick={() => setQueue([])}>Dismiss</button>
               </div>
+              {failed >= 2 && (
+                <div className="batchqueue-note subtle">
+                  Several files failed — if this is unexpected, the backend may
+                  have stopped. Try restarting it, then re-upload. (Your saved
+                  library is on disk and isn't affected.)
+                </div>
+              )}
               {queue.map((it) => (
                 <div className={"batchqueue-row " + it.status} key={it.qid}>
                   <span className={"qdot " + it.status} />
