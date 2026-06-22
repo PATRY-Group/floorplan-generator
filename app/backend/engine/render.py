@@ -52,6 +52,11 @@ from .keyplan import keyplan_group, img_size
 from .keyplan_trace import solidify_walls, _hex
 
 PAGE_W, PAGE_H = 1000, 1080
+# Raster width the branded sheet PNG is rendered at. The sheet is vector SVG, so
+# this only sets output sharpness — well above the 1000px viewBox for crisp
+# fixtures/type when zoomed or printed. Mirrored by main.py's resvg re-render
+# (the custom-font path), so keep the two in sync via this constant.
+SHEET_PNG_W = 2000
 HEADER_H = 92
 FOOTER_H = 140
 PLAN_MAX_W, PLAN_MAX_H = 800, 640
@@ -552,7 +557,7 @@ def render(prims, config):
   {floor_label_svg}
 </svg>'''
 
-    png_bytes = cairosvg.svg2png(bytestring=svg.encode("utf-8"), output_width=900)
+    png_bytes = cairosvg.svg2png(bytestring=svg.encode("utf-8"), output_width=SHEET_PNG_W)
     meta = {
         "transform": {"tx": round(tx, 4), "ty": round(ty, 4), "s": round(s, 6)},
         "page": {"w": PAGE_W, "h": PAGE_H},

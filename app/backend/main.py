@@ -38,7 +38,7 @@ from typing import Optional, List, Dict, Any
 import ezdxf
 
 from engine import (parse_dxf, ParseError, DEFAULT_LAYER_MAP, infer_layer_map,
-                    render, render_keyplan_sheet, trace_plate, colorize_trace,
+                    render, SHEET_PNG_W, render_keyplan_sheet, trace_plate, colorize_trace,
                     dwg_to_dxf, converter_available,
                     ConversionError, extract_brand, BrandError)
 
@@ -169,7 +169,7 @@ def _css_family(fam):
     return (fam or "").replace("\\", "").replace("'", "")
 
 
-def _apply_custom_fonts(svg, png, font_faces, png_width=900):
+def _apply_custom_fonts(svg, png, font_faces, png_width=SHEET_PNG_W):
     """Make uploaded brand fonts render everywhere. cairosvg ignores embedded
     fonts, so when a property carries font faces we (1) inline an @font-face so
     the SVG renders the font in any browser, and (2) re-render the PNG with
@@ -490,10 +490,10 @@ def do_render(req: RenderRequest):
         raise HTTPException(status_code=500, detail="Render failed — see server logs")
     # Embed any uploaded brand fonts so they render in both the SVG and the PNG.
     # Match the resvg re-render width to whatever the cairosvg path used: the
-    # default sheet is 900px, but the plan_only export renders wider (see
+    # default sheet is SHEET_PNG_W, but the plan_only export renders wider (see
     # engine.render), so derive it from meta to keep branded/unbranded PNGs equal.
     png_width = (min(2400, max(1000, round(meta["page"]["w"] * 2)))
-                 if meta.get("plan_only") else 900)
+                 if meta.get("plan_only") else SHEET_PNG_W)
     svg, png = _apply_custom_fonts(svg, png, config.get("font_faces"), png_width=png_width)
 
     keyplan_svg = None
