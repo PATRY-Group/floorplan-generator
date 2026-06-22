@@ -690,6 +690,28 @@ export default function App() {
       toast(e.message, "error");
     }
   }
+  // Batch delete from the library. Returns true once the user confirms (so the
+  // Library can exit selection mode); only the sheets that actually delete are
+  // dropped from state, so a partial failure leaves the rest selectable.
+  async function removeSheets(items) {
+    const n = items.length;
+    if (!n) return false;
+    if (!window.confirm(
+      `Delete ${n} sheet${n > 1 ? "s" : ""}? This can't be undone.`)) return false;
+    const done = [];
+    for (const it of items) {
+      try {
+        await deleteSheet(it.property_id || propertyId, it.sheet_id);
+        done.push(`${it.property_id}/${it.sheet_id}`);
+      } catch (_) { /* counted as failed below */ }
+    }
+    const gone = new Set(done);
+    setSheets((xs) => xs.filter((x) => !gone.has(`${x.property_id}/${x.sheet_id}`)));
+    const failed = n - done.length;
+    if (failed) toast(`Deleted ${done.length}, ${failed} failed`, failed === n ? "error" : "info");
+    else toast(`Deleted ${done.length} sheet${done.length > 1 ? "s" : ""}`, "success");
+    return true;
+  }
   async function renameSheetAction(s, title) {
     const next = (title || "").trim();
     if (!next || next === s.title) return;
@@ -1118,7 +1140,8 @@ export default function App() {
 
         {activeId === "library" ? (
           <Library sheets={sheets}
-            onReopen={reopen} onDelete={removeSheet} onRename={renameSheetAction} />
+            onReopen={reopen} onDelete={removeSheet} onRename={renameSheetAction}
+            onBatchDelete={removeSheets} />
         ) : !ready ? (
           <div className="placeholder">
             <div className="big">▭</div>

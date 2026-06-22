@@ -28,6 +28,7 @@ import re
 import shutil
 import time
 import uuid
+import zipfile
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -709,6 +710,98 @@ def get_sheet_png(prop_id, sheet_id):
         raise HTTPException(status_code=404, detail="Sheet not found.")
     with open(path, "rb") as f:
         return Response(f.read(), media_type="image/png")
+
+
+class _DownloadItem(BaseModel):
+    property_id: str
+    sheet_id: str
+
+
+class DownloadRequest(BaseModel):
+    items: List[_DownloadItem]
+    formats: List[str] = ["png"]   # any of "png", "svg"
+    plan_only: bool = False        # re-render a bare plan (no branding) instead of the saved sheet
+
+
+def _zip_arcname(used, name):
+    """Disambiguate identical export names (same property+title) inside the zip."""
+    if name not in used:
+        used[name] = 0
+        return name
+    used[name] += 1
+    stem, ext = os.path.splitext(name)
+    return f"{stem}-{used[name]}{ext}"
+
+
+def _render_plan_only(prop_id, sheet_id):
+    """Re-render a saved sheet as a bare plan (no header/footer/watermark) from
+    its stored config + geometry. Returns {"svg": str, "png": bytes} or None when
+    the sheet lacks the saved config/prims needed to re-render (older saves)."""
+    d = os.path.join(SHEET_DIR, prop_id)
+    cfg = _read_json(os.path.join(d, f"{sheet_id}.config.json"))
+    raw = _read_json(os.path.join(d, f"{sheet_id}.prims.json"))
+    if not isinstance(cfg, dict) or not isinstance(raw, dict) or "prims" not in raw:
+        return None
+    config = compose_config(load_property(prop_id), cfg.get("metadata"), cfg.get("rooms"))
+    config["plan_only"] = True
+    svg, png, meta = render(raw["prims"], config)
+    png_width = (min(2400, max(1000, round(meta["page"]["w"] * 2)))
+                 if meta.get("plan_only") else SHEET_PNG_W)
+    svg, png = _apply_custom_fonts(svg, png, config.get("font_faces"), png_width=png_width)
+    return {"svg": svg, "png": png}
+
+
+@app.post("/sheets/download")
+def download_sheets(req: DownloadRequest):
+    """Bundle the chosen format(s) for the selected sheets into one ZIP. Keyplans
+    excluded. With plan_only, re-renders each sheet as a bare plan instead of
+    pulling the saved branded artifacts."""
+    if not req.items:
+        raise HTTPException(status_code=400, detail="No sheets selected.")
+    exts = [e for e in ("svg", "png") if e in req.formats]   # filter + normalize order
+    if not exts:
+        raise HTTPException(status_code=400, detail="Pick at least one format (PNG or SVG).")
+    buf = io.BytesIO()
+    used: Dict[str, int] = {}
+    added = 0
+    # mirror Library.jsx exportName(): "<prop-slug>-<title-slug>" (+ "-plan")
+    slug = lambda s: (s or "floorplan").strip().replace(" ", "-").lower()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for it in req.items:
+            _safe_id(it.property_id, "property id")
+            _safe_id(it.sheet_id, "sheet id")
+            d = os.path.join(SHEET_DIR, it.property_id)
+            entry = next((s for s in _read_index(it.property_id)
+                          if s.get("sheet_id") == it.sheet_id), None)
+            title = (entry or {}).get("title", "")
+            name = f"{slug(it.property_id)}-{slug(title)}" + ("-plan" if req.plan_only else "")
+            if req.plan_only:
+                try:
+                    rendered = _render_plan_only(it.property_id, it.sheet_id)
+                except Exception:
+                    logger.exception("Plan-only re-render failed for %s/%s",
+                                     it.property_id, it.sheet_id)
+                    rendered = None
+                if not rendered:
+                    continue
+                for ext in exts:
+                    data = rendered["svg"].encode("utf-8") if ext == "svg" else rendered["png"]
+                    zf.writestr(_zip_arcname(used, f"{name}.{ext}"), data)
+                    added += 1
+            else:
+                for ext in exts:
+                    src = os.path.join(d, f"{it.sheet_id}.{ext}")
+                    if os.path.isfile(src):
+                        zf.write(src, _zip_arcname(used, f"{name}.{ext}"))
+                        added += 1
+    if not added:
+        detail = ("Couldn't re-render plan-only versions — the selected sheets were "
+                  "saved without their source geometry." if req.plan_only
+                  else "None of the selected sheets had files.")
+        raise HTTPException(status_code=404, detail=detail)
+    buf.seek(0)
+    return Response(buf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": 'attachment; filename="floorplans.zip"'})
 
 
 @app.post("/sheets/{prop_id}/{sheet_id}/reopen")
