@@ -13,6 +13,21 @@ import { toast } from "./toast.js";
 const LS_PROP = "fpsg.lastProperty";
 const LS_SESSION = "fpsg.session.v2";   // multi-document shape
 const LS_UI = "fpsg.ui";
+const SUPPRESS_KEY = "fpsg.closeConfirm.until";   // ms timestamp; skip the unsaved-changes dialog until then
+
+// Meaningful, user-editable content of a doc — drives unsaved-changes detection.
+// Compared against the signature captured at the last save (see docSig usage).
+function docSig(d) {
+  return JSON.stringify({
+    propertyId: d.propertyId, rooms: d.rooms, ignored: d.ignored,
+    meta: d.meta, keyplan: d.keyplan,
+  });
+}
+// A tab has work worth warning about if it carries parsed geometry and was
+// either never saved or changed since its last library save.
+function isDirty(d) {
+  return !!(d && d.docId) && (!d.savedId || d.savedSig !== docSig(d));
+}
 
 // Batch upload (spec §11): select up to 10 files; each parsed unit opens as its
 // own editable tab and nothing auto-saves to the library. The queue throttles
@@ -139,6 +154,7 @@ function newDoc(propertyId) {
     svg: "",
     placement: null,
     savedId: null,
+    savedSig: null,        // docSig captured at last save; null until saved
     showHandles: true,
   };
 }
@@ -160,6 +176,8 @@ export default function App() {
   const [saveMenuOpen, setSaveMenuOpen] = useState(false);
 
   const [editing, setEditing] = useState(null);
+  const [closeConfirm, setCloseConfirm] = useState(null);  // id of a dirty tab pending a close decision
+  const [suppress5, setSuppress5] = useState(false);       // "don't ask again for 5 min" checkbox
   const [seedLayer, setSeedLayer] = useState(null);  // detected layer_map to pre-fill a NEW property
   const [showLayerReview, setShowLayerReview] = useState(false);  // detected-layers review table expanded
   const [openSection, setOpenSection] = useState("upload");
@@ -253,7 +271,7 @@ export default function App() {
     const t = setTimeout(() => {
       const slim = docs.map((d) => ({
         id: d.id, propertyId: d.propertyId, docId: d.docId, fileName: d.fileName,
-        savedId: d.savedId, rooms: d.rooms, deletedRooms: d.deletedRooms, ignored: d.ignored,
+        savedId: d.savedId, savedSig: d.savedSig, rooms: d.rooms, deletedRooms: d.deletedRooms, ignored: d.ignored,
         meta: d.meta, suggestions: d.suggestions, warnings: d.warnings,
         keyplan: d.keyplan, showHandles: d.showHandles,
         // layer review (small): survives reload so the banner/table persist; the
@@ -328,6 +346,25 @@ export default function App() {
       }
       return next;
     });
+  }
+  // Close-button entry point: guard tabs that carry unsaved work behind a
+  // confirmation dialog, unless the user recently chose to suppress it.
+  function requestCloseTab(id) {
+    const d = docs.find((x) => x.id === id);
+    const suppressed = Date.now() < Number(localStorage.getItem(SUPPRESS_KEY) || 0);
+    if (!isDirty(d) || suppressed) { closeTab(id); return; }
+    setCloseConfirm(id);
+  }
+  // Apply the "don't ask for 5 minutes" choice (if ticked) and reset the dialog.
+  function applySuppressAndReset() {
+    if (suppress5) localStorage.setItem(SUPPRESS_KEY, String(Date.now() + 5 * 60 * 1000));
+    setSuppress5(false);
+    setCloseConfirm(null);
+  }
+  async function saveAndClose(id) {
+    const sid = await doRender(true, false, id);
+    if (sid) { closeTab(id); applySuppressAndReset(); }
+    else toast("Couldn’t save — the tab was kept open", "error");   // dialog stays up so the user can retry or close anyway
   }
 
   // ---- parse / render ------------------------------------------------------
@@ -470,9 +507,9 @@ export default function App() {
     return true;
   }
 
-  async function doRender(save, asNew = false) {
-    const d = docs.find((x) => x.id === activeId);
-    if (!d || !d.docId) return;
+  async function doRender(save, asNew = false, id = activeId) {
+    const d = docs.find((x) => x.id === id);
+    if (!d || !d.docId) return null;
     const mySeq = (renderSeq.current[d.id] = (renderSeq.current[d.id] || 0) + 1);   // claim the latest slot for THIS doc's preview output
     if (save) setSaving(true); else setRendering(true);
     try {
@@ -490,19 +527,22 @@ export default function App() {
           keyplanSvg: res.keyplan_svg || null, renderError: "",
         } : {}),
         // a completed save is a committed server action: always record it, even
-        // if a newer preview has since superseded the on-screen output
-        ...(save && res.sheet_id ? { savedId: res.sheet_id } : {}),
+        // if a newer preview has since superseded the on-screen output. Capture
+        // the signature of what was saved so later edits read as unsaved again.
+        ...(save && res.sheet_id ? { savedId: res.sheet_id, savedSig: docSig(d) } : {}),
       });
       if (save && res.sheet_id) {
         toast(asNew ? "Saved as a new sheet" :
           d.savedId ? "Changes saved to the library" : "Saved to the library", "success");
         refreshSheets();
       }
+      return save && res.sheet_id ? res.sheet_id : null;
     } catch (e) {
       // surface save failures always; suppress errors from a stale preview
       if (!handleExpiredUpload(d, e) && (save || mySeq === renderSeq.current[d.id])) {
         patchDoc(d.id, { renderError: e.message });
       }
+      return null;
     } finally {
       setRendering(false);
       setSaving(false);
@@ -742,7 +782,7 @@ export default function App() {
             title={tabLabelUnique(d)}
             onClick={() => setActiveId(d.id)}>
             <span className="tablabel">{midTruncate(tabLabelUnique(d))}</span>
-            <span className="tabx" title="Close" onClick={(e) => { e.stopPropagation(); closeTab(d.id); }}>×</span>
+            <span className="tabx" title="Close" onClick={(e) => { e.stopPropagation(); requestCloseTab(d.id); }}>×</span>
           </span>
         ))}
         <button className="tab newtab" title="New floor plan" onClick={newTab}>+</button>
@@ -1156,6 +1196,41 @@ export default function App() {
           }}
         />
       )}
+
+      {closeConfirm && (() => {
+        const d = docs.find((x) => x.id === closeConfirm);
+        const name = d ? tabLabelUnique(d) : "this tab";
+        return (
+          <div className="modal-backdrop" onClick={() => setCloseConfirm(null)}>
+            <div className="modal" style={{ maxWidth: 460 }} onClick={(e) => e.stopPropagation()}>
+              <div className="modal-head">
+                <h2>Unsaved changes</h2>
+                <button className="chip" onClick={() => setCloseConfirm(null)}>✕</button>
+              </div>
+              <div className="modal-body">
+                <p>“{name}” has changes that aren’t saved to the library. Closing it
+                  will discard them.</p>
+                <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 12 }}>
+                  <input type="checkbox" checked={suppress5}
+                    onChange={(e) => setSuppress5(e.target.checked)} />
+                  Don’t ask again for 5 minutes
+                </label>
+              </div>
+              <div className="modal-foot">
+                <button className="btn ghost foot-left" onClick={() => setCloseConfirm(null)}>Cancel</button>
+                <button className="btn danger"
+                  onClick={() => { closeTab(closeConfirm); applySuppressAndReset(); }}>
+                  Close anyway
+                </button>
+                <button className="btn ember" disabled={saving}
+                  onClick={() => saveAndClose(closeConfirm)}>
+                  {saving ? "Saving…" : "Save & close"}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }
