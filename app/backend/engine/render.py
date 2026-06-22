@@ -19,32 +19,45 @@ import math
 import os
 
 
-def _register_cairo_dll_dir():
-    """On Windows, cairosvg's native libcairo-2.dll ships with the GTK runtime
-    but isn't always on PATH for a freshly-launched process. cairocffi resolves
-    the library via ctypes.util.find_library (which searches PATH) and also
-    honours CAIROCFFI_DLL_DIRECTORIES, so register the GTK bin dir on both before
-    the cairosvg import below — making it work regardless of the launching shell."""
-    if os.name != "nt":
-        return
-    candidates = [
-        r"C:\Program Files\GTK3-Runtime Win64\bin",
-        r"C:\Program Files (x86)\GTK3-Runtime Win64\bin",
-        os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                     r"Programs\GTK3-Runtime Win64\bin"),
-    ]
-    for d in candidates:
-        if d and os.path.isdir(d):
-            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
-            existing = os.environ.get("CAIROCFFI_DLL_DIRECTORIES", "")
-            os.environ["CAIROCFFI_DLL_DIRECTORIES"] = (
-                d + (os.pathsep + existing if existing else ""))
-            break
+# PNG is rasterized by resvg-py — a self-contained wheel (bundled Rust renderer)
+# with no native system-library dependency, so it runs in slim containers and
+# serverless runtimes that can't supply cairo's libcairo/GTK. The SVG itself is
+# built in pure Python (below) and is the authoritative artifact; resvg only
+# turns it into a raster. resvg also honours fonts loaded from files, which is
+# why the custom-brand-font path (main.py) already used it.
+import resvg_py
 
-
-_register_cairo_dll_dir()
-
-import cairosvg
+# --- legacy cairosvg PNG path -------------------------------------------------
+# Kept commented during the resvg migration so we can flip back fast if resvg's
+# raster differs; DELETE once resvg output is confirmed good. (Uncommenting also
+# means re-adding `cairosvg` and the native cairo/GTK runtime.)
+#
+# def _register_cairo_dll_dir():
+#     """On Windows, cairosvg's native libcairo-2.dll ships with the GTK runtime
+#     but isn't always on PATH for a freshly-launched process. cairocffi resolves
+#     the library via ctypes.util.find_library (which searches PATH) and also
+#     honours CAIROCFFI_DLL_DIRECTORIES, so register the GTK bin dir on both before
+#     the cairosvg import below — making it work regardless of the launching shell."""
+#     if os.name != "nt":
+#         return
+#     candidates = [
+#         r"C:\Program Files\GTK3-Runtime Win64\bin",
+#         r"C:\Program Files (x86)\GTK3-Runtime Win64\bin",
+#         os.path.join(os.environ.get("LOCALAPPDATA", ""),
+#                      r"Programs\GTK3-Runtime Win64\bin"),
+#     ]
+#     for d in candidates:
+#         if d and os.path.isdir(d):
+#             os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+#             existing = os.environ.get("CAIROCFFI_DLL_DIRECTORIES", "")
+#             os.environ["CAIROCFFI_DLL_DIRECTORIES"] = (
+#                 d + (os.pathsep + existing if existing else ""))
+#             break
+#
+#
+# _register_cairo_dll_dir()
+# import cairosvg
+# ------------------------------------------------------------------------------
 import numpy as np
 from PIL import Image, ImageDraw
 
@@ -416,7 +429,8 @@ def render(prims, config):
             f'{geom}\n{labels}\n</svg>'
         )
         out_w = min(2400, max(1000, round(vbw * 2)))
-        png_bytes = cairosvg.svg2png(bytestring=bare.encode("utf-8"), output_width=out_w)
+        png_bytes = bytes(resvg_py.svg_to_bytes(svg_string=bare, width=out_w))
+        # legacy: png_bytes = cairosvg.svg2png(bytestring=bare.encode("utf-8"), output_width=out_w)
         meta = {
             "transform": {"tx": round(tx, 4), "ty": round(ty, 4), "s": round(s, 6)},
             "page": {"w": round(vbw, 1), "h": round(vbh, 1)},
@@ -558,7 +572,8 @@ def render(prims, config):
   {floor_label_svg}
 </svg>'''
 
-    png_bytes = cairosvg.svg2png(bytestring=svg.encode("utf-8"), output_width=SHEET_PNG_W)
+    png_bytes = bytes(resvg_py.svg_to_bytes(svg_string=svg, width=SHEET_PNG_W))
+    # legacy: png_bytes = cairosvg.svg2png(bytestring=svg.encode("utf-8"), output_width=SHEET_PNG_W)
     meta = {
         "transform": {"tx": round(tx, 4), "ty": round(ty, 4), "s": round(s, 6)},
         "page": {"w": PAGE_W, "h": PAGE_H},
