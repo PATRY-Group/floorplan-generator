@@ -985,6 +985,12 @@ export default function App() {
                     </div>
                   </div>
                 ))}
+                <p className="subtle" style={{ marginTop: 8 }}>
+                  Missing dimensions? Check if any were missed by uploading your DXF file at{" "}
+                  <a href="https://sharecad.org/" target="_blank" rel="noopener noreferrer">
+                    sharecad.org
+                  </a>.
+                </p>
                 {active.ignored.length > 0 && (
                   <div className="ignored">
                     Ignored text (click to add as a room):
