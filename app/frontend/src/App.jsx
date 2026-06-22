@@ -31,6 +31,22 @@ const exportName = (propId, title, suffix = "") => {
   return propId ? `${slugify(propId)}-${base}` : base;
 };
 
+// Unit name derived from the uploaded filename. DXF titleblocks often share a
+// generic label (e.g. every unit's sheet says "2 BED"), so the filename is the
+// only reliable per-unit distinguisher. When a " - " / " – " separator is present
+// we take the trailing segment ("Amrstrong - Unit 2-E" -> "Unit 2-E"), dropping a
+// shared building/property prefix; otherwise we keep the whole base name. Never
+// returns empty — an empty title would fall through to the generic DXF guess and
+// reintroduce the duplicate-title problem.
+function titleFromFileName(fileName) {
+  const raw = (fileName || "").split(/[\\/]/).pop() || "";   // strip any directory
+  const base = raw.replace(/\.[^.]+$/, "").trim();           // strip any extension
+  if (!base) return "";
+  const parts = base.split(/\s+[-–]\s+/);                    // " - " or " – "
+  const tail = parts.length > 1 ? parts[parts.length - 1].trim() : "";
+  return (tail || base).replace(/\s+/g, " ").trim();
+}
+
 // Best-effort unit name when the DXF doesn't carry one: count bedrooms.
 function guessTitle(labels) {
   const beds = (labels || []).filter(
@@ -91,7 +107,7 @@ function parsedDocFields(d, fileName) {
     svg: "",
     savedId: null,
     meta: {
-      title: (d.suggestions && d.suggestions.title) || guessTitle(d.labels),
+      title: titleFromFileName(fileName) || (d.suggestions && d.suggestions.title) || guessTitle(d.labels),
       suite: (d.suggestions && d.suggestions.suite) || "",
       sf: (d.suggestions && d.suggestions.sf) || "",
     },
