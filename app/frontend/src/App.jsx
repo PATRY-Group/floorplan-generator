@@ -1095,10 +1095,10 @@ export default function App() {
                   title="Overlay a centered SOLD OUT stamp on the sheet">
                   {active.meta.sold_out ? "✓ Sold out" : "Sold out"}
                 </button>
-                <button className={"btn ghost" + (active.meta.wall_style === "skinny" ? " active" : "")}
-                  onClick={() => patchActive((d) => ({ meta: { ...d.meta, wall_style: d.meta.wall_style === "skinny" ? "solid" : "skinny" } }))}
-                  title="Skinny outline walls vs solid poché fill">
-                  {active.meta.wall_style === "skinny" ? "✓ Skinny walls" : "Skinny walls"}
+                <button className={"btn ghost" + (active.meta.wall_style !== "solid" ? " active" : "")}
+                  onClick={() => patchActive((d) => ({ meta: { ...d.meta, wall_style: d.meta.wall_style === "solid" ? "skinny" : "solid" } }))}
+                  title="Skinny outline walls (default) vs solid poché fill">
+                  {active.meta.wall_style !== "solid" ? "✓ Skinny walls" : "Skinny walls"}
                 </button>
                 <button className="btn ghost icon" disabled={rendering} onClick={() => doRender(false)}
                   title="Reload — re-render the preview (e.g. after editing the property's brand)">
