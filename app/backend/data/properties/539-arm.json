@@ -16,7 +16,7 @@
   },
   "fonts": {
     "serif": "Gordita",
-    "sans": "'Helvetica Neue', Helvetica, Arial, sans-serif"
+    "sans": "Verdana, Geneva, sans-serif"
   },
   "brand_swatches": [
     {
@@ -114,34 +114,33 @@
   "font_faces": null,
   "layer_map": {
     "wall_line": [
-      "A-WALL",
-      "I-WALL"
+      "A_WALL_FULL_N",
+      "WALL-centrelines"
     ],
     "wall_fill": [
-      "A-WALL-PATT"
+      "A_WALL_CAVITY"
     ],
     "door": [
       "A-DOOR",
-      "A-DOOR-FRAM"
+      "DOOR",
+      "DOOR-detail",
+      "DOOR-line"
     ],
     "glazing": [
-      "A-GLAZ"
+      "WINDOW-notes"
     ],
-    "dashed": [
-      "A-DETL-HDLN",
-      "A-FLOR-OVHD"
-    ],
+    "dashed": [],
     "room_label": [
-      "G-ANNO-TEXT"
+      "A_TEXT_BLOWUPS"
     ],
     "drop": [
-      "A-AREA-IDEN",
-      "S-COLS-SYMB",
-      "S-STRS",
-      "S-STRS-MBND"
+      "DIM",
+      "GRID-line",
+      "MECH-grilles"
     ],
     "floor_hatch": [
-      "A-FLOR"
+      "A_FLOR_FIXT_N",
+      "A_FLOR_WDWK_N"
     ]
   }
 }

@@ -213,6 +213,33 @@ def trace_plate(plate_bytes, seal=35):
     return buf.getvalue(), cov
 
 
+def solidify_walls(mask, close_k, open_k=3, speckle=30, smooth=0.9):
+    """Turn wall *linework* — two parallel faces per wall, drawn as thin strokes
+    into a boolean mask — into one solid filled band (the poché). For DXFs that
+    carry no wall HATCH (plain-AutoCAD exports), this synthesizes the solid-wall
+    fill the renderer otherwise gets from a hatch.
+
+    Mirrors the interior-wall pipeline `trace_plate` runs (close -> open ->
+    drop-speckle -> smooth): the close bridges the gap between a wall's two faces
+    so each wall reads as one band; the open shaves spurs; `_drop_small` kills
+    isolated speckle; `_smooth` rounds raster stair-steps.
+
+    Deliberately does NOT `_fill_holes` or `_largest_component` (the footprint
+    helpers): each room is an enclosed background region, so a hole-fill would
+    paint whole rooms solid black and a largest-component keep would drop
+    disconnected interior partitions. `close_k` must be wider than the wall
+    cavity gap but far narrower than a room (the caller sizes it from plan span).
+    """
+    band = _morph(_morph(mask, close_k, True), close_k, False)   # close: bridge faces
+    if open_k and open_k >= 3:
+        band = _morph(_morph(band, open_k, False), open_k, True)  # open: shave spurs
+    if speckle:
+        band = _drop_small(band, speckle)
+    if smooth and smooth > 0:
+        band = _smooth(band, smooth)
+    return band
+
+
 def _hex(s):
     s = s.lstrip("#")
     return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))

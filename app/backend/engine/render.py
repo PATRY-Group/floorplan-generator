@@ -11,7 +11,11 @@ in the footer (the standalone key-plan page is produced separately by
 engine.keyplan.render_keyplan_sheet).
 """
 
+import base64
+import hashlib
 import html
+import io
+import math
 import os
 
 
@@ -45,11 +49,13 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from .keyplan import keyplan_group, img_size
+from .keyplan_trace import solidify_walls, _hex
 
 PAGE_W, PAGE_H = 1000, 1080
 HEADER_H = 92
 FOOTER_H = 140
 PLAN_MAX_W, PLAN_MAX_H = 800, 640
+SKINNY_WALL_W = 0.8   # wall-outline stroke for the "skinny" (no-fill) wall style
 
 DEFAULT_SERIF = "Georgia, 'Times New Roman', serif"
 DEFAULT_SANS = "'Helvetica Neue', Helvetica, Arial, sans-serif"
@@ -93,6 +99,68 @@ def _glyph_width(font_data_uri, s, size, ls):
         gn = cmap.get(ord(ch))
         total += (hmtx[gn][0] if gn and gn in hmtx.metrics else upm * 0.6)
     return total / upm * size + ls * max(len(s) - 1, 0) + 6
+
+
+# Synthesized wall poché is colour-independent, so the (slow) morphology is
+# cached by geometry+kernel and only the cheap colorize runs per render. The live
+# preview re-renders on every palette/label edit but the wall geometry is stable.
+_POCHE_CACHE = {}
+
+
+def _poche_close_k(plan_w, plan_h, override=None):
+    """Close-kernel width in px: wide enough to bridge a wall's two faces, far
+    narrower than a room. Scales with the plan span so it holds across sheet
+    sizes; ~7-9 px for a typical unit. `override` (config["poche_close_px"]) is
+    the escape hatch for an unusual wall thickness."""
+    if override:
+        return max(3, int(override))
+    return max(7, math.ceil(0.006 * max(plan_w, plan_h)))
+
+
+def _wall_band_mask(wall_lines, cavity_lines, close_k):
+    """Rasterize wall linework (already in page coords) at page resolution and
+    solidify the double-line faces into one filled band. Returns a boolean
+    (PAGE_H, PAGE_W) mask, cached by geometry+kernel."""
+    h = hashlib.md5(str(close_k).encode())
+    for tag, lines in ((b"W", wall_lines), (b"C", cavity_lines)):
+        for line in lines:
+            h.update(tag)
+            h.update(np.asarray(line, dtype=np.float32).tobytes())
+    key = h.digest()
+    band = _POCHE_CACHE.get(key)
+    if band is not None:
+        return band
+    occ = Image.new("1", (PAGE_W, PAGE_H), 0)
+    dr = ImageDraw.Draw(occ)
+    for line in (*wall_lines, *cavity_lines):
+        if len(line) >= 2:
+            dr.line([(float(x), float(y)) for x, y in line], fill=1, width=3)
+    band = solidify_walls(np.asarray(occ, dtype=bool), close_k)
+    if len(_POCHE_CACHE) > 32:
+        _POCHE_CACHE.clear()
+    _POCHE_CACHE[key] = band
+    return band
+
+
+def _wall_poche_image(wall_lines, cavity_lines, plan_w, plan_h, wall_hex,
+                      close_override=None):
+    """Solid-wall poché synthesized from wall linework, as a full-page (PAGE_W x
+    PAGE_H) base64 PNG <image> tag positioned in page coords — transparent except
+    the wall band, so it overlays cleanly under the crisp vector wall strokes in
+    either export path. Returns None if there is no wall geometry."""
+    if not (wall_lines or cavity_lines):
+        return None
+    band = _wall_band_mask(wall_lines, cavity_lines,
+                           _poche_close_k(plan_w, plan_h, close_override))
+    if not band.any():
+        return None
+    rgba = np.zeros((PAGE_H, PAGE_W, 4), np.uint8)
+    rgba[band] = (*_hex(wall_hex), 255)
+    buf = io.BytesIO()
+    Image.fromarray(rgba, "RGBA").save(buf, "PNG")
+    uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    return (f'<image href="{uri}" x="0" y="0" width="{PAGE_W}" height="{PAGE_H}" '
+            f'preserveAspectRatio="none"/>')
 
 
 def _role_lookup(layer_map):
@@ -163,7 +231,7 @@ def render(prims, config):
         return ty - y * s
 
     wall_fills, wall_lines, glaz_lines, door_lines, swing_lines = [], [], [], [], []
-    thin_lines, dash_lines = [], []
+    thin_lines, dash_lines, cavity_lines = [], [], []
     occ_img = Image.new("1", (PAGE_W, PAGE_H), 0)
     dr = ImageDraw.Draw(occ_img)
     for layer, kind, data, block in kept:
@@ -183,6 +251,11 @@ def render(prims, config):
         pts = [(X(x), Y(y)) for x, y in data]
         if role == "wall_line":
             wall_lines.append(pts)
+        elif role == "wall_fill":
+            # A wall_fill layer carrying lines (not a hatch) — the inner cavity
+            # faces of a plain-AutoCAD wall. Kept apart so they can feed poché
+            # synthesis below instead of disappearing into faint thin_lines.
+            cavity_lines.append(pts)
         elif role == "glazing":
             glaz_lines.append(pts)
         elif role == "door":
@@ -268,6 +341,35 @@ def render(prims, config):
             room_labels.append(halo_text(px, py + n_size * 0.36,
                                          n_size, n_ls, 0.78, esc(name)))
 
+    # Wall style is a per-sheet choice carried in metadata (default "solid").
+    # "skinny" draws both wall faces as thin uniform outlines with no fill — the
+    # 539 sheet's original look. "solid" keeps the poché behaviour below.
+    wall_style = (config.get("metadata") or {}).get("wall_style") or "solid"
+    wall_stroke = 1.6
+    poche_img = None
+    if wall_style == "skinny":
+        # Both faces (outer wall_lines + inner cavity_lines) as thin strokes; no
+        # fill from any source (drop a hatch poché too, so Revit files go skinny).
+        wall_fills = []
+        wall_lines = wall_lines + cavity_lines
+        wall_stroke = SKINNY_WALL_W
+    else:
+        # Synthesize solid wall poché when the file carries wall linework but no
+        # wall HATCH to fill (plain-AutoCAD / CloudConvert exports). `not
+        # wall_fills` is the load-bearing gate: Revit/hatch files have a non-empty
+        # wall_fills and never enter here, so their output stays byte-identical.
+        if (config.get("synthesize_poche", True) and not wall_fills
+                and (wall_lines or cavity_lines)):
+            poche_img = _wall_poche_image(wall_lines, cavity_lines, plan_w, plan_h,
+                                          WALL, config.get("poche_close_px"))
+        if poche_img:
+            # The cavity faces are now part of the solid band — stroke them in
+            # wall ink too so every band edge stays crisp vector (the soft raster
+            # edge hides under it). Otherwise they revert to faint thin lines.
+            wall_lines = wall_lines + cavity_lines
+        else:
+            thin_lines = thin_lines + cavity_lines
+
     def polyline_group(lines, style):
         return "\n".join(f'<polyline points="{_pts_attr(p)}" {style}/>'
                          for p in lines if len(p) >= 2)
@@ -278,9 +380,10 @@ def render(prims, config):
     # or key-plan chrome. Default output is unaffected; this is a separate path.
     if config.get("plan_only"):
         geom = (
-            '<g stroke-linecap="round" stroke-linejoin="round" fill="none">\n'
+            (poche_img + "\n" if poche_img else "")
+            + '<g stroke-linecap="round" stroke-linejoin="round" fill="none">\n'
             f'<path d="{" ".join(wall_fills)}" fill="{WALL}" stroke="none" fill-rule="nonzero"/>\n'
-            + polyline_group(wall_lines, f'stroke="{WALL}" stroke-width="1.6"') + "\n"
+            + polyline_group(wall_lines, f'stroke="{WALL}" stroke-width="{wall_stroke}"') + "\n"
             + polyline_group(glaz_lines, f'stroke="{WALL}" stroke-width="0.9"') + "\n"
             + polyline_group(door_lines, f'stroke="{WALL}" stroke-width="1.0"') + "\n"
             + polyline_group(swing_lines, f'stroke="{WALL}" stroke-width="0.7" stroke-opacity="0.45"') + "\n"
@@ -427,9 +530,10 @@ def render(prims, config):
   <text x="{name_x:.0f}" y="50" font-size="21" letter-spacing="7" fill="#FFFFFF">{prop_name}</text>
   <text x="{name_x:.0f}" y="71" font-size="11" letter-spacing="4" fill="{MID}" fill-opacity="0.85">{location}</text>
   <text x="{PAGE_W-60}" y="56" text-anchor="end" font-size="11" letter-spacing="3.5" fill="{MID}" fill-opacity="0.7">{header_right}</text>
+  {poche_img or ''}
   <g stroke-linecap="round" stroke-linejoin="round" fill="none">
     <path d="{' '.join(wall_fills)}" fill="{WALL}" stroke="none" fill-rule="nonzero"/>
-{polyline_group(wall_lines, f'stroke="{WALL}" stroke-width="1.6"')}
+{polyline_group(wall_lines, f'stroke="{WALL}" stroke-width="{wall_stroke}"')}
 {polyline_group(glaz_lines, f'stroke="{WALL}" stroke-width="0.9"')}
 {polyline_group(door_lines, f'stroke="{WALL}" stroke-width="1.0"')}
 {polyline_group(swing_lines, f'stroke="{WALL}" stroke-width="0.7" stroke-opacity="0.45"')}

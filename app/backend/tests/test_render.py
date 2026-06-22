@@ -10,9 +10,12 @@ import re
 import unittest
 import xml.etree.ElementTree as ET
 
+import numpy as np
+
 import fixtures as fx
-from engine import render
+from engine import render, DEFAULT_LAYER_MAP
 from engine.render import PAGE_W, PAGE_H, DEFAULT_PALETTE
+from engine.keyplan_trace import solidify_walls
 
 
 def parse_unit_prims():
@@ -122,9 +125,11 @@ class WatermarkTest(unittest.TestCase):
             metadata={"title": "T", "watermark": "8"}))
         long, _, _ = render(self.prims, fx.base_render_config(
             metadata={"title": "T", "watermark": "1234567890"}))
-        self.assertEqual(self._wm_font_size(short), 430)      # min(430, 1500/1)
-        self.assertEqual(self._wm_font_size(long), 150)       # 1500/10
-        self.assertLess(self._wm_font_size(long), self._wm_font_size(short))
+        long_sz, short_sz = self._wm_font_size(long), self._wm_font_size(short)
+        assert long_sz is not None and short_sz is not None   # narrow Optional[int]
+        self.assertEqual(short_sz, 430)      # min(430, 1500/1)
+        self.assertEqual(long_sz, 150)       # 1500/10
+        self.assertLess(long_sz, short_sz)
 
     def test_watermark_image_replaces_text_mark(self):
         data_uri = "data:image/png;base64,AAAA"
@@ -165,6 +170,102 @@ class PlanOnlyTest(unittest.TestCase):
         # no header/footer band text, but the room label survives
         self.assertNotIn("FOR ILLUSTRATIVE PURPOSES ONLY", svg)
         self.assertIn("BEDROOM", svg)
+
+
+class SolidifyWallsTest(unittest.TestCase):
+    """The core poché synthesis: two parallel wall faces (linework) become one
+    solid filled band, while a wide room gap is left empty."""
+
+    def test_close_bridges_the_gap_between_two_faces(self):
+        m = np.zeros((40, 40), bool)
+        m[10:30, 10] = True          # left face
+        m[10:30, 16] = True          # right face — a 6px cavity between them
+        band = solidify_walls(m, close_k=9, speckle=0, smooth=0)
+        self.assertTrue(band[20, 13])           # midpoint of the wall is filled
+        self.assertTrue(band[20, 10] and band[20, 16])  # faces still solid
+
+    def test_room_sized_gap_is_not_filled(self):
+        m = np.zeros((60, 60), bool)
+        m[10:50, 10] = True          # two faces 40px apart — a room, not a wall
+        m[10:50, 50] = True
+        band = solidify_walls(m, close_k=9, speckle=0, smooth=0)
+        self.assertFalse(band[30, 30])          # the room interior stays empty
+
+
+class PocheSynthesisTest(unittest.TestCase):
+    """Solid wall poché synthesized from linework when a DXF carries no wall
+    HATCH (plain-AutoCAD / CloudConvert exports), gated so hatch files are
+    untouched."""
+
+    LAYER_MAP = {"wall_line": ["A_WALL_FULL_N"], "wall_fill": ["A_WALL_CAVITY"]}
+
+    def _linework_prims(self):
+        # two parallel faces of a wall ring on line layers — no hatch anywhere
+        outer = [(0, 0), (20, 0), (20, 15), (0, 15), (0, 0)]
+        inner = [(0.5, 0.5), (19.5, 0.5), (19.5, 14.5), (0.5, 14.5), (0.5, 0.5)]
+        return [["A_WALL_FULL_N", "line", outer, ""],
+                ["A_WALL_CAVITY", "line", inner, ""]]
+
+    def test_linework_walls_get_a_synthesized_poche_image(self):
+        cfg = fx.base_render_config(layer_map=self.LAYER_MAP)
+        svg, png, _ = render(self._linework_prims(), cfg)
+        ET.fromstring(svg)                              # well-formed
+        self.assertIn("<image", svg)                   # poché overlay emitted
+        self.assertIn("data:image/png;base64,", svg)
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        # no hatch -> the vector wall_fills path is empty (fill comes from the image)
+        self.assertIn('<path d="" fill=', svg)
+
+    def test_poche_can_be_disabled(self):
+        cfg = fx.base_render_config(layer_map=self.LAYER_MAP,
+                                    synthesize_poche=False)
+        svg, _, _ = render(self._linework_prims(), cfg)
+        self.assertNotIn("<image", svg)
+
+    def test_hatch_file_is_left_untouched(self):
+        """The load-bearing gate: a file with a real wall HATCH keeps its vector
+        poché and gets NO synthesized raster image, so its output is unchanged."""
+        prims = parse_unit_prims()        # build_unit_dxf draws an A-WALL-PATT hatch
+        # the default Revit map maps A-WALL-PATT -> wall_fill, so the hatch fills
+        svg, _, _ = render(prims, fx.base_render_config(layer_map=DEFAULT_LAYER_MAP))
+        self.assertNotIn("<image", svg)               # synthesis never fired
+        self.assertNotIn('<path d="" fill=', svg)     # the hatch rendered as fill
+
+    def test_plan_only_export_also_synthesizes(self):
+        cfg = fx.base_render_config(layer_map=self.LAYER_MAP, plan_only=True)
+        svg, _, _ = render(self._linework_prims(), cfg)
+        ET.fromstring(svg)
+        self.assertIn("<image", svg)
+
+    def test_skinny_style_draws_thin_outlines_no_fill(self):
+        """metadata.wall_style == 'skinny' -> both wall faces as thin (0.8)
+        outlines, no poché image and no solid fill path."""
+        cfg = fx.base_render_config(
+            layer_map=self.LAYER_MAP,
+            metadata={"title": "2 BED", "wall_style": "skinny"})
+        svg, _, _ = render(self._linework_prims(), cfg)
+        ET.fromstring(svg)
+        self.assertNotIn("<image", svg)              # no synthesized fill
+        self.assertIn('stroke-width="0.8"', svg)     # skinny outline weight
+        self.assertIn('<path d="" fill=', svg)       # wall_fills suppressed
+
+    def test_default_style_is_solid(self):
+        """No wall_style keeps the poché — skinny is opt-in only."""
+        cfg = fx.base_render_config(
+            layer_map=self.LAYER_MAP, metadata={"title": "2 BED"})
+        svg, _, _ = render(self._linework_prims(), cfg)
+        self.assertIn("<image", svg)
+        self.assertNotIn('stroke-width="0.8"', svg)
+
+    def test_skinny_suppresses_a_hatch_fill(self):
+        """Skinny on a real-hatch file drops the solid poché too (no fill path)."""
+        prims = parse_unit_prims()        # build_unit_dxf draws an A-WALL-PATT hatch
+        cfg = fx.base_render_config(
+            layer_map=DEFAULT_LAYER_MAP,
+            metadata={"title": "2 BED", "wall_style": "skinny"})
+        svg, _, _ = render(prims, cfg)
+        self.assertNotIn("<image", svg)
+        self.assertIn('<path d="" fill=', svg)       # hatch fill suppressed
 
 
 if __name__ == "__main__":
