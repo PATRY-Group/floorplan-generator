@@ -44,12 +44,17 @@ from engine import (parse_dxf, ParseError, DEFAULT_LAYER_MAP, infer_layer_map,
                     ConversionError, extract_brand, BrandError)
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.join(BASE, "data")
+# DATA_DIR override lets a serverless/container deployment point storage at a
+# writable path (e.g. /tmp on Vercel, or a mounted volume); defaults to ./data.
+DATA = os.environ.get("DATA_DIR") or os.path.join(BASE, "data")
 PROP_DIR = os.path.join(DATA, "properties")
 UP_DIR = os.path.join(DATA, "uploads")
 SHEET_DIR = os.path.join(DATA, "sheets")
 for d in (PROP_DIR, UP_DIR, SHEET_DIR):
-    os.makedirs(d, exist_ok=True)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass  # read-only FS (serverless) — file storage gets swapped to Blob (step 4)
 
 MAX_UPLOAD_MB = 60
 UPLOAD_TTL_HOURS = 168  # working files in uploads/ older than this get swept (1 week)

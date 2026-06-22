@@ -1,0 +1,3 @@
+# Vercel's Python builder installs from a requirements.txt at the repo root.
+# Reuse the backend's pinned set so there's a single source of truth.
+-r app/backend/requirements.txt
