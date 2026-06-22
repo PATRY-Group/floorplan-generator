@@ -724,6 +724,11 @@ def reopen_sheet(prop_id, sheet_id):
             detail="This sheet can't be re-opened — its source geometry wasn't "
                    "saved with it. Re-upload the DXF to edit.")
     cfg = _read_json(cfg_path)
+    if not isinstance(cfg, dict):
+        raise HTTPException(
+            status_code=404,
+            detail="This sheet can't be re-opened — its saved config is "
+                   "unreadable. Re-upload the DXF to edit.")
     new_doc = uuid.uuid4().hex[:12]
     shutil.copy(prims_path, os.path.join(UP_DIR, f"{new_doc}.prims.json"))
     cfg["doc_id"] = new_doc
