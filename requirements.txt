@@ -1,3 +1,15 @@
-# Vercel's Python builder installs from a requirements.txt at the repo root.
-# Reuse the backend's pinned set so there's a single source of truth.
--r app/backend/requirements.txt
+# Vercel's Python builder parses this file directly and does NOT support `-r`
+# includes — so deps are listed inline. Keep in sync with
+# app/backend/requirements.txt, with two deliberate omissions for the serverless
+# function:
+#   - uvicorn: Vercel serves the ASGI app itself; the function never runs uvicorn.
+#   - cairosvg: the app rasterizes via resvg-py now (no libcairo on Lambda anyway).
+# Dropping both also trims the bundle against Vercel's function-size limit.
+fastapi>=0.110
+python-multipart>=0.0.9
+ezdxf>=1.1
+numpy>=1.24
+Pillow>=10.0
+resvg-py>=0.3
+fonttools>=4.0
+PyMuPDF>=1.24
