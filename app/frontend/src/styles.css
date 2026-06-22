@@ -241,6 +241,15 @@ select, input[type="text"] {
   margin-bottom: 8px;
 }
 .batchqueue-head .subtle { margin: 0; }
+.batchqueue-note {
+  font-size: 12px;
+  line-height: 1.45;
+  background: #fbf3e9;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 10px;
+  margin-bottom: 8px;
+}
 .batchqueue-row {
   display: flex;
   align-items: center;
@@ -553,6 +562,11 @@ select, input[type="text"] {
   color: var(--ember); font-size: 11px; cursor: pointer; text-decoration: underline;
 }
 .linkish:hover { color: var(--charcoal); }
+.font-warn {
+  margin: 6px 0 0; padding: 7px 9px; font-size: 11px; line-height: 1.4;
+  color: #8a5a1e; background: rgba(193, 127, 58, 0.1);
+  border: 1px solid rgba(193, 127, 58, 0.35); border-radius: 6px;
+}
 
 /* Keep the actions pinned to the top of the preview while the sheet scrolls. */
 .stagebar.sticky {
@@ -569,8 +583,21 @@ select, input[type="text"] {
 .library { width: 100%; max-width: 760px; margin-top: 26px; margin-bottom: 60px; }
 .library h4 { font-size: 11px; letter-spacing: 2px; text-transform: uppercase; color: var(--muted); }
 .libgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
-.libcard { background: #fff; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.libcard { position: relative; background: #fff; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.libcard.sel { outline: 2px solid var(--ember); outline-offset: -2px; }
+.libcheck {
+  position: absolute; top: 7px; left: 7px; width: 18px; height: 18px; z-index: 2; cursor: pointer;
+  accent-color: var(--ember);
+  filter: drop-shadow(0 0 1px #fff) drop-shadow(0 0 2px #fff);
+}
 .libcard img { width: 100%; display: block; }
+.libthumb { position: relative; display: block; }
+.thumbhint {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  background: rgba(20, 30, 48, 0.42); color: #fff; font-size: 12px; font-weight: 600;
+  letter-spacing: 0.4px; opacity: 0; transition: opacity 0.14s ease;
+}
+.libthumb:hover .thumbhint { opacity: 1; }
 .libcard .cap { padding: 7px 9px; font-size: 11px; color: var(--muted); }
 .capttl { font-size: 12px; color: var(--ink); font-weight: 600; display: flex; align-items: center; gap: 6px; }
 .capsub { margin: 2px 0 6px; }
@@ -590,6 +617,44 @@ select, input[type="text"] {
 .libhead { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .libhead h4 { margin: 0; }
 .libsearch { width: 200px; padding: 6px 9px; border: 1px solid var(--line); border-radius: 6px; font-size: 12px; }
+/* batch-download toolbar (in line with the search bar) */
+.libtools { display: flex; align-items: stretch; justify-content: flex-end; flex-wrap: nowrap; gap: 10px; flex: 1; min-width: 0; }
+.libbatch { display: flex; align-items: stretch; flex-wrap: nowrap; gap: 10px; flex: 1; }
+.libselectall, .libcancel, .libdownload {
+  display: inline-flex; align-items: center; justify-content: center; align-self: stretch;
+  white-space: nowrap; font-size: 12px; padding: 0 18px; border-radius: 5px;
+  border: 1px solid var(--line); background: #fff; color: var(--charcoal); cursor: pointer;
+}
+/* let the action buttons share the bar width comfortably */
+.libbatch > .libselectall, .libbatch > .libcancel, .libbatch > .libdownload-wrap { flex: 1; }
+.libdownload-wrap > .libdownload { width: 100%; }
+.libselectall:hover, .libcancel:hover { color: var(--ember); }
+.libdownload { background: var(--ember); color: #fff; border-color: var(--ember); font-weight: 600; }
+.libdownload:disabled { opacity: 0.55; cursor: default; }
+.libdownload .caret { margin-left: 6px; font-size: 9px; line-height: 1; }
+/* batch-action dropdown: menu (Download ▸ / Delete) hangs off the button */
+.libdownload-wrap { position: relative; display: inline-flex; align-self: stretch; }
+.libmenu {
+  position: absolute; top: calc(100% + 4px); right: 0; z-index: 10; min-width: 150px;
+  background: #fff; border: 1px solid var(--line); border-radius: 6px; overflow: hidden;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12); padding: 4px;
+}
+.libmenu button {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  width: 100%; text-align: left; white-space: nowrap; cursor: pointer; border-radius: 4px;
+  padding: 7px 10px; font-size: 12px; border: none; background: #fff; color: var(--charcoal);
+}
+.libmenu button:hover { background: rgba(193, 127, 58, 0.1); color: var(--ember); }
+.libmenu .caret { font-size: 10px; color: var(--muted); }
+.libsubmenu { padding: 0 0 2px 10px; }
+.libsubmenu button { font-size: 11px; padding: 6px 10px; color: var(--muted); }
+.libsub-label {
+  font-size: 8.5px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted);
+  padding: 6px 10px 2px; opacity: 0.75;
+}
+.libmenu-sep { height: 1px; margin: 4px 6px; background: rgba(154, 59, 40, 0.5); }
+.libmenu button.danger { color: #9a3b28; font-weight: 600; }
+.libmenu button.danger:hover { background: rgba(154, 59, 40, 0.1); color: #9a3b28; }
 /* property filter chips */
 .libfilters { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
 .libchip {

@@ -123,6 +123,13 @@ export default function PropertySetup({ initial, seedLayerMap, onClose, onSaved,
   const setPal = (k, v) => setP((o) => ({ ...o, palette: { ...o.palette, [k]: v } }));
   const setFont = (k, v) => setP((o) => ({ ...o, fonts: { ...o.fonts, [k]: v } }));
   const faceFor = (role) => (p.font_faces || []).find((f) => f.role === role) || null;
+  // a role uses a typed installed-name font (not a preset, not an embedded file)
+  const usesTypedFont = (role, presets) => {
+    const cur = p.fonts[role] || "";
+    return !faceFor(role) && !!cur && !presets.some(([, s]) => s === cur);
+  };
+  const showFontWarn = usesTypedFont("serif", FONT_PRESETS.serif)
+    || usesTypedFont("sans", FONT_PRESETS.sans);
 
   // Upload a brand font file: the backend reads its family name and returns it
   // embedded, so the sheet can render it (preview + PNG) without installing it.
@@ -438,6 +445,12 @@ export default function PropertySetup({ initial, seedLayerMap, onClose, onSaved,
               (e.g. Oswald) so it renders in the preview and the PNG without being
               installed anywhere. Or pick a preset / type an installed font name.
             </p>
+            {showFontWarn && (
+              <p className="font-warn">
+                Be careful with typing font names — machines without the font installed won’t
+                render correctly and may fall back to unwanted fonts. Upload the .ttf/.otf to embed it.
+              </p>
+            )}
             <div className="row">
               {fontField("serif", "Display font", FONT_PRESETS.serif)}
               {fontField("sans", "Body font", FONT_PRESETS.sans)}

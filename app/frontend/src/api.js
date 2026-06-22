@@ -108,6 +108,21 @@ export function sheetUrl(propertyId, sheetId, ext) {
   return `${BASE}/sheets/${propertyId}/${sheetId}.${ext}`;
 }
 
+// Batch download: POST selected sheets + formats, get back a ZIP blob. Has its
+// own error path because handle() assumes a JSON body; this response is binary.
+export async function downloadSheets(items, formats, planOnly = false) {
+  const r = await fetch(BASE + "/sheets/download", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ items, formats, plan_only: planOnly }),
+  });
+  if (!r.ok) {
+    const data = await r.json().catch(() => null);
+    throw new Error((data && data.detail) || "Download failed");
+  }
+  return r.blob();
+}
+
 export async function reopenSheet(propertyId, sheetId) {
   const r = await fetch(BASE + `/sheets/${propertyId}/${sheetId}/reopen`, { method: "POST" });
   return handle(r, "Re-open failed");
