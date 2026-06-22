@@ -19,13 +19,13 @@ State lives on disk under data/. The uploads cache is swept automatically.
 """
 
 import base64
-import glob
+# import glob      # now via storage.glob (filesystem or Blob)
 import io
 import json
 import logging
 import os
 import re
-import shutil
+# import shutil    # now via storage.copy / storage.rmtree
 import time
 import uuid
 import zipfile
@@ -42,6 +42,7 @@ from engine import (parse_dxf, ParseError, DEFAULT_LAYER_MAP, infer_layer_map,
                     render, SHEET_PNG_W, render_keyplan_sheet, trace_plate, colorize_trace,
                     dwg_to_dxf, converter_available,
                     ConversionError, extract_brand, BrandError)
+import storage   # filesystem (local/Docker) or Vercel Blob, chosen by env token
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 # DATA_DIR override lets a serverless/container deployment point storage at a
@@ -54,7 +55,8 @@ for d in (PROP_DIR, UP_DIR, SHEET_DIR):
     try:
         os.makedirs(d, exist_ok=True)
     except OSError:
-        pass  # read-only FS (serverless) — file storage gets swapped to Blob (step 4)
+        pass  # read-only FS (serverless) — storage routes to Blob instead
+storage.ROOT = DATA   # paths under DATA map to blob keys relative to this root
 
 MAX_UPLOAD_MB = 60
 UPLOAD_TTL_HOURS = 168  # working files in uploads/ older than this get swept (1 week)
@@ -80,10 +82,10 @@ def sweep_uploads(max_age_hours: float = UPLOAD_TTL_HOURS) -> int:
     """Delete working files in uploads/ older than max_age_hours. Returns count."""
     cutoff = time.time() - max_age_hours * 3600
     removed = 0
-    for fn in glob.glob(os.path.join(UP_DIR, "*")):
+    for fn in storage.glob(os.path.join(UP_DIR, "*")):
         try:
-            if os.path.isfile(fn) and os.path.getmtime(fn) < cutoff:
-                os.remove(fn)
+            if storage.getmtime(fn) < cutoff:
+                storage.remove(fn)
                 removed += 1
         except OSError:
             pass
@@ -112,25 +114,14 @@ def _safe_id(value, what="id"):
 
 
 def _read_json(path, default=None):
-    """Read a JSON file, returning `default` if it doesn't exist."""
-    if not os.path.isfile(path):
-        return default
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    """Read a JSON file (or blob), returning `default` if it doesn't exist."""
+    return storage.read_json(path, default)
 
 
 def _write_json(path, data, **dump_kw):
-    """Write JSON atomically: dump to a sibling temp file, then os.replace it
-    into place — so a reader (or a crash mid-write) never sees a truncated file.
-    The replace is atomic on a single filesystem, which all of data/ is."""
-    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, **dump_kw)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+    """Write JSON through the storage backend. The filesystem backend writes
+    atomically (temp + replace) so a reader never sees a truncated file."""
+    storage.write_json(path, data, **dump_kw)
 
 
 def load_property(prop_id):
@@ -165,9 +156,8 @@ def compose_config(prop, metadata, rooms, palette_override=None, layer_map_overr
 def _plate_bytes(plate_id):
     if not plate_id:
         return None
-    for fn in glob.glob(os.path.join(UP_DIR, f"{plate_id}_plate*")):
-        with open(fn, "rb") as f:
-            return f.read()
+    for fn in storage.glob(os.path.join(UP_DIR, f"{plate_id}_plate*")):
+        return storage.read_bytes(fn)
     return None
 
 
@@ -261,24 +251,24 @@ def _trace_mask(plate_id, seal):
     seal = max(7, min(61, int(seal) | 1))   # clamp + force odd
     cache = os.path.join(UP_DIR, f"{plate_id}_tracew{seal}.png")
     covfile = cache + ".cov"
-    if os.path.isfile(cache):
+    cached = storage.read_bytes(cache)
+    if cached is not None:
         # coverage is persisted alongside the mask so a cache hit still reports it
+        cov = None   # older cache without a sidecar — coverage unknown
         try:
-            with open(covfile) as f:
-                cov = float(f.read().strip())
-        except (OSError, ValueError):
-            cov = None   # older cache without a sidecar — coverage unknown
-        with open(cache, "rb") as f:
-            return f.read(), cov
+            cov_text = storage.read_text(covfile)
+            if cov_text is not None:
+                cov = float(cov_text.strip())
+        except ValueError:
+            pass
+        return cached, cov
     raw = _plate_bytes(plate_id)
     if not raw:
         return None, 0.0
     mask, cov = trace_plate(raw, seal=seal)
-    with open(cache, "wb") as f:
-        f.write(mask)
+    storage.write_bytes(cache, mask)
     try:
-        with open(covfile, "w") as f:
-            f.write(repr(float(cov)))
+        storage.write_text(covfile, repr(float(cov)))
     except OSError:
         pass
     return mask, cov
@@ -327,6 +317,9 @@ async def parse(file: UploadFile = File(...), property_id: Optional[str] = Form(
             "Can't read .rvt files. Export the floor plan as a DXF VIEW from Revit "
             "first (not a sheet), then upload that. See FLOORPLAN_WORKFLOW.md, Part 1."))
     doc_id = uuid.uuid4().hex[:12]
+    # The source upload is written to the LOCAL filesystem (not storage/Blob) on
+    # purpose: ezdxf and the ODA converter need a real file path, and it's only
+    # read within this same request. On serverless this lands in /tmp (writable).
     src_path = os.path.join(UP_DIR, f"{doc_id}_{os.path.basename(name) or 'upload'}")
     with open(src_path, "wb") as f:
         f.write(raw)
@@ -365,8 +358,10 @@ async def parse(file: UploadFile = File(...), property_id: Optional[str] = Form(
         except Exception:
             logger.exception("Layer auto-detection failed for doc_id=%s", doc_id)
             raise HTTPException(status_code=422, detail=str(exc))
-    with open(os.path.join(UP_DIR, f"{doc_id}.prims.json"), "w", encoding="utf-8") as f:
-        json.dump({"prims": result["prims"], "extents": result["extents"]}, f)
+    # prims.json must persist for a later /render (possibly a different instance),
+    # so it goes through storage (Blob in serverless).
+    storage.write_json(os.path.join(UP_DIR, f"{doc_id}.prims.json"),
+                       {"prims": result["prims"], "extents": result["extents"]})
     return {"doc_id": doc_id, "labels": result["labels"],
             "ignored_text": result["ignored_text"], "suggestions": result["suggestions"],
             "warnings": result.get("warnings", []), "extents": result["extents"],
@@ -386,8 +381,7 @@ async def upload_plate(file: UploadFile = File(...)):
         raise HTTPException(status_code=413, detail="Plate image too large (max 25 MB).")
     ext = os.path.splitext(file.filename or "plate.png")[1] or ".png"
     plate_id = uuid.uuid4().hex[:12]
-    with open(os.path.join(UP_DIR, f"{plate_id}_plate{ext}"), "wb") as f:
-        f.write(raw)
+    storage.write_bytes(os.path.join(UP_DIR, f"{plate_id}_plate{ext}"), raw)
     w = h = None
     try:
         from PIL import Image
@@ -403,12 +397,13 @@ def get_plate(plate_id: str):
     the plate_id, so re-opening or restoring a sheet needs this to repaint the
     box-placement picker."""
     _safe_id(plate_id, "plate id")
-    for fn in glob.glob(os.path.join(UP_DIR, f"{plate_id}_plate*")):
+    for fn in storage.glob(os.path.join(UP_DIR, f"{plate_id}_plate*")):
         media = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
                  ".webp": "image/webp", ".bmp": "image/bmp"}.get(
                      os.path.splitext(fn)[1].lower(), "image/png")
-        with open(fn, "rb") as f:
-            return Response(content=f.read(), media_type=media)
+        data = storage.read_bytes(fn)
+        if data is not None:
+            return Response(content=data, media_type=media)
     raise HTTPException(status_code=404, detail="Plate not found or expired.")
 
 
@@ -464,12 +459,11 @@ class RenderRequest(BaseModel):
 
 
 def _load_prims(doc_id):
-    path = os.path.join(UP_DIR, f"{doc_id}.prims.json")
-    if not os.path.isfile(path):
+    data = storage.read_json(os.path.join(UP_DIR, f"{doc_id}.prims.json"))
+    if data is None:
         raise HTTPException(status_code=404,
                             detail="Upload expired or not found. Re-upload the file.")
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)["prims"]
+    return data["prims"]
 
 
 @app.post("/render")
@@ -521,7 +515,6 @@ def do_render(req: RenderRequest):
     sheet_id = None
     if req.save and req.property_id and not req.plan_only:
         out = os.path.join(SHEET_DIR, req.property_id)
-        os.makedirs(out, exist_ok=True)
         index = os.path.join(out, "index.json")
         sheets = _read_json(index, [])
 
@@ -530,33 +523,30 @@ def do_render(req: RenderRequest):
             if req.sheet_id else None
         sheet_id = req.sheet_id if existing else uuid.uuid4().hex[:10]
 
-        with open(os.path.join(out, f"{sheet_id}.svg"), "w", encoding="utf-8") as f:
-            f.write(svg)
-        with open(os.path.join(out, f"{sheet_id}.png"), "wb") as f:
-            f.write(png)
+        storage.write_text(os.path.join(out, f"{sheet_id}.svg"), svg)
+        storage.write_bytes(os.path.join(out, f"{sheet_id}.png"), png)
         kp_path = os.path.join(out, f"{sheet_id}-keyplan.svg")
         if keyplan_svg:
-            with open(kp_path, "w", encoding="utf-8") as f:
-                f.write(keyplan_svg)
-        elif os.path.isfile(kp_path):
-            os.remove(kp_path)   # key plan was dropped since the last save
+            storage.write_text(kp_path, keyplan_svg)
+        else:
+            storage.remove(kp_path)   # key plan dropped since last save (no-op if absent)
         # persist the editable config + geometry so the sheet can be re-opened
         _write_json(os.path.join(out, f"{sheet_id}.config.json"),
                     {"property_id": req.property_id, "metadata": req.metadata,
                      "rooms": req.rooms, "keyplan": req.keyplan})
         prims_src = os.path.join(UP_DIR, f"{req.doc_id}.prims.json")
-        if os.path.isfile(prims_src):
-            shutil.copy(prims_src, os.path.join(out, f"{sheet_id}.prims.json"))
+        if storage.exists(prims_src):
+            storage.copy(prims_src, os.path.join(out, f"{sheet_id}.prims.json"))
         # Preserve the key-plan plate image alongside the sheet. The config keeps
-        # only the plate_id, and the plate lives in the sweepable uploads dir — so
+        # only the plate_id, and the plate lives in the sweepable uploads area — so
         # copy it in (mirroring the prims-on-save above) to survive the uploads sweep.
         # The ext is derived from the stored upload filename, not assumed.
         plate_id = (req.keyplan or {}).get("plate_id")
         if plate_id:
-            for fn in glob.glob(os.path.join(UP_DIR, f"{plate_id}_plate*")):
+            for fn in storage.glob(os.path.join(UP_DIR, f"{plate_id}_plate*")):
                 ext = os.path.splitext(fn)[1]
                 try:
-                    shutil.copy(fn, os.path.join(out, f"{sheet_id}-plate{ext}"))
+                    storage.copy(fn, os.path.join(out, f"{sheet_id}-plate{ext}"))
                 except OSError:
                     pass   # plate already swept — degrade gracefully, don't fail the save
                 break
@@ -583,10 +573,11 @@ def do_render(req: RenderRequest):
 @app.get("/properties")
 def list_properties():
     out = []
-    for fn in sorted(os.listdir(PROP_DIR)):
+    for fn in sorted(storage.listdir(PROP_DIR)):
         if fn.endswith(".json"):
-            with open(os.path.join(PROP_DIR, fn), encoding="utf-8") as f:
-                out.append(json.load(f))
+            prop = storage.read_json(os.path.join(PROP_DIR, fn))
+            if prop is not None:
+                out.append(prop)
     return out
 
 
@@ -631,13 +622,10 @@ def put_property(prop_id, prop: Property):
 @app.delete("/properties/{prop_id}")
 def delete_property(prop_id):
     _safe_id(prop_id, "property id")
-    path = os.path.join(PROP_DIR, f"{prop_id}.json")
-    if os.path.isfile(path):
-        os.remove(path)
+    storage.remove(os.path.join(PROP_DIR, f"{prop_id}.json"))   # no-op if absent
     # Also drop the property's saved-sheet library; otherwise the orphaned
-    # directory keeps surfacing in GET /sheets. rmtree is guarded so a missing
-    # dir doesn't crash the delete.
-    shutil.rmtree(os.path.join(SHEET_DIR, prop_id), ignore_errors=True)
+    # entries keep surfacing in GET /sheets.
+    storage.rmtree(os.path.join(SHEET_DIR, prop_id))
     return {"deleted": prop_id}
 
 
@@ -653,8 +641,8 @@ def list_all_sheets():
     """Every saved sheet across all properties, each annotated with its
     property id + name, newest first — the unified library."""
     out = []
-    for prop_id in sorted(os.listdir(SHEET_DIR)) if os.path.isdir(SHEET_DIR) else []:
-        if not os.path.isdir(os.path.join(SHEET_DIR, prop_id)):
+    for prop_id in sorted(storage.listdir(SHEET_DIR)):
+        if not storage.isdir(os.path.join(SHEET_DIR, prop_id)):
             continue
         prop = load_property(prop_id) or {}
         pname = prop.get("name") or prop_id
@@ -684,7 +672,7 @@ def rename_sheet(prop_id, sheet_id, req: RenameRequest):
     d = os.path.join(SHEET_DIR, prop_id)
     title = req.title.strip()
     index = os.path.join(d, "index.json")
-    if not os.path.isfile(index):
+    if not storage.exists(index):
         raise HTTPException(status_code=404, detail="Sheet not found.")
     sheets = _read_json(index, [])
     entry = next((s for s in sheets if s.get("sheet_id") == sheet_id), None)
@@ -693,7 +681,7 @@ def rename_sheet(prop_id, sheet_id, req: RenameRequest):
     entry["title"] = title
     _write_json(index, sheets, indent=2, ensure_ascii=False)
     cfg_path = os.path.join(d, f"{sheet_id}.config.json")
-    if os.path.isfile(cfg_path):
+    if storage.exists(cfg_path):
         cfg = _read_json(cfg_path, {})
         cfg.setdefault("metadata", {})["title"] = title
         _write_json(cfg_path, cfg, ensure_ascii=False)
@@ -704,22 +692,20 @@ def rename_sheet(prop_id, sheet_id, req: RenameRequest):
 def get_sheet_svg(prop_id, sheet_id):
     _safe_id(prop_id, "property id")
     _safe_id(sheet_id, "sheet id")
-    path = os.path.join(SHEET_DIR, prop_id, f"{sheet_id}.svg")
-    if not os.path.isfile(path):
+    text = storage.read_text(os.path.join(SHEET_DIR, prop_id, f"{sheet_id}.svg"))
+    if text is None:
         raise HTTPException(status_code=404, detail="Sheet not found.")
-    with open(path, encoding="utf-8") as f:
-        return Response(f.read(), media_type="image/svg+xml")
+    return Response(text, media_type="image/svg+xml")
 
 
 @app.get("/sheets/{prop_id}/{sheet_id}.png")
 def get_sheet_png(prop_id, sheet_id):
     _safe_id(prop_id, "property id")
     _safe_id(sheet_id, "sheet id")
-    path = os.path.join(SHEET_DIR, prop_id, f"{sheet_id}.png")
-    if not os.path.isfile(path):
+    data = storage.read_bytes(os.path.join(SHEET_DIR, prop_id, f"{sheet_id}.png"))
+    if data is None:
         raise HTTPException(status_code=404, detail="Sheet not found.")
-    with open(path, "rb") as f:
-        return Response(f.read(), media_type="image/png")
+    return Response(data, media_type="image/png")
 
 
 class _DownloadItem(BaseModel):
@@ -798,9 +784,9 @@ def download_sheets(req: DownloadRequest):
                     added += 1
             else:
                 for ext in exts:
-                    src = os.path.join(d, f"{it.sheet_id}.{ext}")
-                    if os.path.isfile(src):
-                        zf.write(src, _zip_arcname(used, f"{name}.{ext}"))
+                    data = storage.read_bytes(os.path.join(d, f"{it.sheet_id}.{ext}"))
+                    if data is not None:
+                        zf.writestr(_zip_arcname(used, f"{name}.{ext}"), data)
                         added += 1
     if not added:
         detail = ("Couldn't re-render plan-only versions — the selected sheets were "
@@ -819,7 +805,7 @@ def reopen_sheet(prop_id, sheet_id):
     d = os.path.join(SHEET_DIR, prop_id)
     cfg_path = os.path.join(d, f"{sheet_id}.config.json")
     prims_path = os.path.join(d, f"{sheet_id}.prims.json")
-    if not os.path.isfile(cfg_path) or not os.path.isfile(prims_path):
+    if not storage.exists(cfg_path) or not storage.exists(prims_path):
         raise HTTPException(
             status_code=404,
             detail="This sheet can't be re-opened — its source geometry wasn't "
@@ -831,7 +817,7 @@ def reopen_sheet(prop_id, sheet_id):
             detail="This sheet can't be re-opened — its saved config is "
                    "unreadable. Re-upload the DXF to edit.")
     new_doc = uuid.uuid4().hex[:12]
-    shutil.copy(prims_path, os.path.join(UP_DIR, f"{new_doc}.prims.json"))
+    storage.copy(prims_path, os.path.join(UP_DIR, f"{new_doc}.prims.json"))
     cfg["doc_id"] = new_doc
     # Restore the preserved key-plan plate back into uploads under the SAME
     # plate_id the config references, so GET /plate/{plate_id} resolves again and
@@ -839,10 +825,10 @@ def reopen_sheet(prop_id, sheet_id):
     plate_id = (cfg.get("keyplan") or {}).get("plate_id")
     if plate_id:
         _safe_id(plate_id, "plate id")
-        for fn in glob.glob(os.path.join(d, f"{sheet_id}-plate*")):
+        for fn in storage.glob(os.path.join(d, f"{sheet_id}-plate*")):
             ext = os.path.splitext(fn)[1]
             try:
-                shutil.copy(fn, os.path.join(UP_DIR, f"{plate_id}_plate{ext}"))
+                storage.copy(fn, os.path.join(UP_DIR, f"{plate_id}_plate{ext}"))
             except OSError:
                 pass   # preserved plate missing — picker just won't repaint
             break
@@ -854,15 +840,12 @@ def delete_sheet(prop_id, sheet_id):
     _safe_id(prop_id, "property id")
     _safe_id(sheet_id, "sheet id")
     d = os.path.join(SHEET_DIR, prop_id)
-    for fn in glob.glob(os.path.join(d, f"{sheet_id}.*")) + \
-            glob.glob(os.path.join(d, f"{sheet_id}-keyplan.*")) + \
-            glob.glob(os.path.join(d, f"{sheet_id}-plate*")):
-        try:
-            os.remove(fn)
-        except OSError:
-            pass
+    for fn in storage.glob(os.path.join(d, f"{sheet_id}.*")) + \
+            storage.glob(os.path.join(d, f"{sheet_id}-keyplan.*")) + \
+            storage.glob(os.path.join(d, f"{sheet_id}-plate*")):
+        storage.remove(fn)
     index = os.path.join(d, "index.json")
-    if os.path.isfile(index):
+    if storage.exists(index):
         sheets = [s for s in _read_json(index, []) if s.get("sheet_id") != sheet_id]
         _write_json(index, sheets, indent=2, ensure_ascii=False)
     return {"deleted": sheet_id}
@@ -871,37 +854,36 @@ def delete_sheet(prop_id, sheet_id):
 # --------------------------------------------------------------------------- #
 # production: serve the built SPA from this same app (single origin)
 # --------------------------------------------------------------------------- #
-# In dev the React app runs on Vite (:5173) and reaches this API through Vite's
-# /api proxy, which strips the /api prefix before forwarding (vite.config.js).
-# In a built deployment there is no Vite — this one app serves BOTH the static
-# frontend and the API on a single origin. The frontend always calls /api/*
-# (frontend/api.js), so we strip a leading /api here to reach the root-mounted
-# routes above. This activates ONLY when a built frontend (frontend/dist) is
-# present, so local dev behaviour is completely unchanged.
+# The frontend always calls /api/* (frontend/api.js). In dev, Vite's proxy strips
+# /api before forwarding (vite.config.js), so this app sees root paths. In any
+# built deployment (Vercel function, or the single-service container) the request
+# arrives WITH /api, so we strip it here to reach the root-mounted routes above.
+# Stripping is always safe: if /api was already removed upstream, there's nothing
+# to strip. So the middleware is unconditional; only serving the static SPA is
+# gated on a built frontend/dist being present (it isn't in the Vercel function).
+class _StripApiPrefix:
+    """ASGI middleware: rewrite /api/* -> /* so the SPA's same-origin API calls
+    reach the existing root-mounted routes. No-op when /api isn't present."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            path = scope.get("path", "")
+            if path == "/api" or path.startswith("/api/"):
+                scope = dict(scope)
+                scope["path"] = path[4:] or "/"
+                scope["raw_path"] = scope["path"].encode("utf-8")
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_StripApiPrefix)
+
 _FRONTEND_DIST = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))
-
 if os.path.isdir(_FRONTEND_DIST):
     from fastapi.staticfiles import StaticFiles
-
-    class _StripApiPrefix:
-        """ASGI middleware: rewrite /api/* -> /* so the SPA's same-origin API
-        calls reach the existing root-mounted routes. No-op in dev (the Vite
-        proxy already stripped /api before the request reached this app)."""
-
-        def __init__(self, app):
-            self.app = app
-
-        async def __call__(self, scope, receive, send):
-            if scope.get("type") == "http":
-                path = scope.get("path", "")
-                if path == "/api" or path.startswith("/api/"):
-                    scope = dict(scope)
-                    scope["path"] = path[4:] or "/"
-                    scope["raw_path"] = scope["path"].encode("utf-8")
-            await self.app(scope, receive, send)
-
-    app.add_middleware(_StripApiPrefix)
     # Mounted last so every API route above takes precedence; html=True serves
     # index.html at / (the app is a single page with no client-side routing).
     app.mount("/", StaticFiles(directory=_FRONTEND_DIST, html=True), name="spa")

@@ -13,3 +13,4 @@ Pillow>=10.0
 resvg-py>=0.3
 fonttools>=4.0
 PyMuPDF>=1.24
+vercel_blob          # Blob storage client — only needed in the serverless deploy
