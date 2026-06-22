@@ -206,8 +206,11 @@ class PocheSynthesisTest(unittest.TestCase):
         return [["A_WALL_FULL_N", "line", outer, ""],
                 ["A_WALL_CAVITY", "line", inner, ""]]
 
-    def test_linework_walls_get_a_synthesized_poche_image(self):
-        cfg = fx.base_render_config(layer_map=self.LAYER_MAP)
+    # Poché is now opt-in (skinny is the default), so these pass wall_style solid.
+    SOLID = {"title": "2 BED", "wall_style": "solid"}
+
+    def test_solid_linework_walls_get_a_synthesized_poche_image(self):
+        cfg = fx.base_render_config(layer_map=self.LAYER_MAP, metadata=self.SOLID)
         svg, png, _ = render(self._linework_prims(), cfg)
         ET.fromstring(svg)                              # well-formed
         self.assertIn("<image", svg)                   # poché overlay emitted
@@ -217,22 +220,24 @@ class PocheSynthesisTest(unittest.TestCase):
         self.assertIn('<path d="" fill=', svg)
 
     def test_poche_can_be_disabled(self):
-        cfg = fx.base_render_config(layer_map=self.LAYER_MAP,
+        cfg = fx.base_render_config(layer_map=self.LAYER_MAP, metadata=self.SOLID,
                                     synthesize_poche=False)
         svg, _, _ = render(self._linework_prims(), cfg)
         self.assertNotIn("<image", svg)
 
-    def test_hatch_file_is_left_untouched(self):
-        """The load-bearing gate: a file with a real wall HATCH keeps its vector
-        poché and gets NO synthesized raster image, so its output is unchanged."""
+    def test_solid_hatch_file_is_left_untouched(self):
+        """The load-bearing gate: in solid mode a file with a real wall HATCH
+        keeps its vector poché and gets NO synthesized raster image."""
         prims = parse_unit_prims()        # build_unit_dxf draws an A-WALL-PATT hatch
         # the default Revit map maps A-WALL-PATT -> wall_fill, so the hatch fills
-        svg, _, _ = render(prims, fx.base_render_config(layer_map=DEFAULT_LAYER_MAP))
+        svg, _, _ = render(prims, fx.base_render_config(
+            layer_map=DEFAULT_LAYER_MAP, metadata=self.SOLID))
         self.assertNotIn("<image", svg)               # synthesis never fired
         self.assertNotIn('<path d="" fill=', svg)     # the hatch rendered as fill
 
-    def test_plan_only_export_also_synthesizes(self):
-        cfg = fx.base_render_config(layer_map=self.LAYER_MAP, plan_only=True)
+    def test_solid_plan_only_export_also_synthesizes(self):
+        cfg = fx.base_render_config(layer_map=self.LAYER_MAP,
+                                    metadata=self.SOLID, plan_only=True)
         svg, _, _ = render(self._linework_prims(), cfg)
         ET.fromstring(svg)
         self.assertIn("<image", svg)
@@ -249,13 +254,14 @@ class PocheSynthesisTest(unittest.TestCase):
         self.assertIn('stroke-width="0.8"', svg)     # skinny outline weight
         self.assertIn('<path d="" fill=', svg)       # wall_fills suppressed
 
-    def test_default_style_is_solid(self):
-        """No wall_style keeps the poché — skinny is opt-in only."""
+    def test_default_style_is_skinny(self):
+        """With no wall_style, the default is now skinny — thin outlines, no
+        poché image; solid is opt-in."""
         cfg = fx.base_render_config(
             layer_map=self.LAYER_MAP, metadata={"title": "2 BED"})
         svg, _, _ = render(self._linework_prims(), cfg)
-        self.assertIn("<image", svg)
-        self.assertNotIn('stroke-width="0.8"', svg)
+        self.assertNotIn("<image", svg)
+        self.assertIn('stroke-width="0.8"', svg)
 
     def test_skinny_suppresses_a_hatch_fill(self):
         """Skinny on a real-hatch file drops the solid poché too (no fill path)."""

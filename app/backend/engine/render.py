@@ -341,10 +341,10 @@ def render(prims, config):
             room_labels.append(halo_text(px, py + n_size * 0.36,
                                          n_size, n_ls, 0.78, esc(name)))
 
-    # Wall style is a per-sheet choice carried in metadata (default "solid").
-    # "skinny" draws both wall faces as thin uniform outlines with no fill — the
-    # 539 sheet's original look. "solid" keeps the poché behaviour below.
-    wall_style = (config.get("metadata") or {}).get("wall_style") or "solid"
+    # Wall style is a per-sheet choice carried in metadata. Default "skinny":
+    # both wall faces as thin uniform outlines with no fill (the 539 sheet's
+    # original look). Opt into "solid" for the poché fill behaviour below.
+    wall_style = (config.get("metadata") or {}).get("wall_style") or "skinny"
     wall_stroke = 1.6
     poche_img = None
     if wall_style == "skinny":
