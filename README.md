@@ -2,7 +2,7 @@
 
 Turn a single-unit CAD floor plan (DXF, or DWG via a converter) into a **branded
 marketing sheet** (SVG + PNG) — with room labels placed automatically and a
-drag-to-fix editor. Built for a non-technical coordinator: upload a file, pick a
+drag-to-fix editor. Upload a file, pick a
 property, export a finished sheet. No coordinate entry.
 
 ![Example sheet](app/references/EXAMPLE_one-bed-sheet.png)
@@ -46,10 +46,9 @@ npm run dev
 Then open http://localhost:5173. The dev server proxies `/api/*` to the backend,
 so there's nothing else to configure.
 
-**Native deps:** `cairosvg` needs Cairo for PNG output (Windows: the GTK3
-runtime ships it and the engine auto-registers it). DWG input is optional and
-needs the ODA File Converter (`ODA_CONVERTER` env var); without it, only DXF is
-accepted.
+**Native deps:** PNG output goes through `resvg-py`, a self-contained wheel — no
+system Cairo/GTK needed. DWG input is optional and needs the ODA File Converter
+(`ODA_CONVERTER` env var); without it, only DXF is accepted.
 
 **Tests:** the backend has a hermetic suite (stdlib `unittest`). Run it from
 `app/backend/` with `python -m unittest discover -s tests -p "test_*.py"`.
@@ -65,6 +64,53 @@ accepted.
 
 Read the spec and workflow docs before making non-trivial changes — they encode
 the reasoning behind most design decisions.
+
+## Deploying (Vercel)
+
+The app runs as a **single serverless function** on Vercel — one origin serves
+both the React UI and the `/api/*` backend. The whole thing is wired through
+[`vercel.json`](vercel.json): every route is sent to [`api/index.py`](api/index.py),
+which imports the FastAPI app from [`app/backend/main.py`](app/backend/main.py)
+and serves the pre-built frontend (`app/frontend/dist/`) as static files.
+
+**Storage.** Serverless filesystems are ephemeral, so file I/O routes through
+[`app/backend/storage.py`](app/backend/storage.py), a pluggable backend chosen at
+import: if `BLOB_READ_WRITE_TOKEN` is set it uses **Vercel Blob** (persistent,
+shared); otherwise it uses the local filesystem exactly as before. Local dev, the
+test suite, and any Docker image are untouched — only the Vercel deploy uses Blob.
+
+To deploy:
+
+```bash
+# 1. build the frontend and force-add dist (it's gitignored for dev)
+cd app/frontend && npm run build && cd ../..
+git add app/frontend/dist -f
+
+# 2. in Vercel: create a Public Blob store, connect it to the project
+#    (this injects BLOB_READ_WRITE_TOKEN as an env var automatically)
+
+# 3. deploy
+vercel --prod
+```
+
+**Seeding existing work.** To copy properties/sheets already on your local disk
+into the Blob store (so the deployed app shows them), pull the token and run the
+one-time seed:
+
+```bash
+vercel env pull .env.local --environment=production   # writes BLOB_READ_WRITE_TOKEN
+cd app/backend
+python seed_blob.py            # properties only
+python seed_blob.py --sheets   # also the saved-sheet library
+```
+
+It uploads to the same keys the app reads, so the deployed app picks them up on
+the next refresh — no redeploy needed. Safe to re-run (it overwrites).
+
+A [`Dockerfile`](Dockerfile) is also included for container hosts (Render, Fly,
+Railway): it builds the frontend, then serves everything from uvicorn on port
+8000. Without a Blob token it uses the container filesystem (mount a volume to
+persist).
 
 ## Status
 
