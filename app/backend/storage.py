@@ -92,9 +92,7 @@ def _blob_read_bytes(path):
 
 def _blob_write_bytes(path, data):
     # addRandomSuffix off so the key stays stable and addressable by pathname.
-    # Access is left to the store's setting (this store is Private), so we don't
-    # force "public" here.
-    _blob().put(_key(path), data, {"addRandomSuffix": False})
+    _blob().put(_key(path), data, {"addRandomSuffix": False, "allowOverwrite": True})
 
 
 # --------------------------------------------------------------------------- #
