@@ -13,3 +13,6 @@ app/frontend/dist/
 
 # Large CAD source files — reference samples only, never processed by the app
 *.rvt
+
+.vercel
+.env*
