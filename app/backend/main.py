@@ -39,7 +39,7 @@ from typing import Optional, List, Dict, Any
 from ezdxf.filemanagement import readfile
 
 from engine import (parse_dxf, ParseError, DEFAULT_LAYER_MAP, infer_layer_map,
-                    render, SHEET_PNG_W, render_keyplan_sheet, trace_plate, colorize_trace,
+                    render, render_png, SHEET_PNG_W, render_keyplan_sheet, trace_plate, colorize_trace,
                     dwg_to_dxf, converter_available,
                     ConversionError, extract_brand, BrandError)
 import storage   # filesystem (local/Docker) or Vercel Blob, chosen by env token
@@ -195,7 +195,6 @@ def _apply_custom_fonts(svg, png, font_faces, png_width=SHEET_PNG_W):
     tmp = []
     try:
         import tempfile
-        import resvg_py
         for f in faces:
             head, _, b64 = f["data"].partition(",")
             ext = ".otf" if ("otf" in head or "opentype" in head) else ".ttf"
@@ -203,7 +202,10 @@ def _apply_custom_fonts(svg, png, font_faces, png_width=SHEET_PNG_W):
             os.write(fd, base64.b64decode(b64))
             os.close(fd)
             tmp.append(path)
-        png2 = bytes(resvg_py.svg_to_bytes(svg_string=svg2, width=png_width, font_files=tmp))
+        # uploaded brand faces take precedence; render_png appends the bundled
+        # Arimo/Gelasio fallbacks so any text the brand font doesn't cover (and the
+        # generic serif/sans stacks) still render on a no-system-font host.
+        png2 = render_png(svg2, png_width, extra_font_files=tmp)
         return svg2, png2
     except Exception:
         return svg2, png
