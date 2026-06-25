@@ -1,9 +1,10 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import {
   getCapabilities, listProperties, parseFile, renderSheet,
   listAllSheets, reopenSheet, deleteSheet, renameSheet,
 } from "./api.js";
 import LabelOverlay from "./LabelOverlay.jsx";
+import PaintToolbar, { PaintBucketButton } from "./PaintToolbar.jsx";
 import PropertySetup from "./PropertySetup.jsx";
 import KeyPlanPanel from "./KeyPlanPanel.jsx";
 import Library from "./Library.jsx";
@@ -156,6 +157,8 @@ function newDoc(propertyId) {
     savedId: null,
     savedSig: null,        // docSig captured at last save; null until saved
     showHandles: true,
+    paintMode: false,      // transient: paint tools open (not persisted)
+    paintImage: null,      // flattened PNG data-URI of manual paint strokes
   };
 }
 
@@ -174,6 +177,14 @@ export default function App() {
   const [pngBusy, setPngBusy] = useState(false);
   const [dlOpen, setDlOpen] = useState(false);
   const [saveMenuOpen, setSaveMenuOpen] = useState(false);
+
+  // Paint tool state — App-level so it survives mode/tab toggles. Size is
+  // remembered per tool so switching brush<->eraser restores that tool's size.
+  const [paintTool, setPaintTool] = useState("brush");
+  const [paintColor, setPaintColor] = useState("#FFFFFF");
+  const [paintBrushSize, setPaintBrushSize] = useState(6);
+  const [paintEraserSize, setPaintEraserSize] = useState(16);
+  const paintApi = useRef(null);   // { undo, clear, hasPaint } registered by PaintCanvas
 
   const [editing, setEditing] = useState(null);
   const [closeConfirm, setCloseConfirm] = useState(null);  // id of a dirty tab pending a close decision
@@ -199,6 +210,8 @@ export default function App() {
   const active = docs.find((d) => d.id === activeId) || null;
   const propertyId = active ? active.propertyId : defaultProp;
   const ready = !!(active && active.docId);
+  const paintModeRef = useRef(false);          // current paint-mode, read by the global Ctrl+Z handler (effect deps don't track it)
+  paintModeRef.current = !!(active && active.paintMode);
 
   // ---- doc state helpers ---------------------------------------------------
   function patchDoc(id, patch) {
@@ -206,6 +219,18 @@ export default function App() {
       ? { ...d, ...(typeof patch === "function" ? patch(d) : patch) } : d)));
   }
   const patchActive = (patch) => { if (activeId) patchDoc(activeId, patch); };
+
+  // ---- paint handlers ------------------------------------------------------
+  const paintSize = paintTool === "eraser" ? paintEraserSize : paintBrushSize;
+  const setPaintSize = (v) =>
+    (paintTool === "eraser" ? setPaintEraserSize : setPaintBrushSize)(v);
+  // PaintCanvas reads this from a ref each render, so a fresh identity is fine.
+  const onPaintChange = (url) => { if (activeId) patchDoc(activeId, { paintImage: url }); };
+  // Stable so PaintCanvas's register effect doesn't re-run every render.
+  const registerPaint = useCallback((api) => { paintApi.current = api; }, []);
+  // Handles are hidden during paint by the call-site guard (showHandles &&
+  // !paintMode), so we only flip paintMode — exiting restores the user's setting.
+  const togglePaint = () => patchActive((d) => ({ paintMode: !d.paintMode }));
 
   // ---- mount: capabilities, properties, recents, session restore ----------
   useEffect(() => {
@@ -274,7 +299,7 @@ export default function App() {
         id: d.id, propertyId: d.propertyId, docId: d.docId, fileName: d.fileName,
         savedId: d.savedId, savedSig: d.savedSig, rooms: d.rooms, deletedRooms: d.deletedRooms, ignored: d.ignored,
         meta: d.meta, suggestions: d.suggestions, warnings: d.warnings,
-        keyplan: d.keyplan, showHandles: d.showHandles,
+        keyplan: d.keyplan, showHandles: d.showHandles, paintImage: d.paintImage,
         // layer review (small): survives reload so the banner/table persist; the
         // File can't be persisted, so Apply&re-parse disables until a re-upload.
         layerInferred: d.layerInferred, layerReport: d.layerReport,
@@ -300,6 +325,9 @@ export default function App() {
       const tag = el && el.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || (el && el.isContentEditable)) return;
       e.preventDefault();
+      // In paint mode, Ctrl+Z undoes the last paint stroke first; once there's no
+      // paint history left it falls through to the normal label/room undo.
+      if (paintModeRef.current && paintApi.current?.undo()) return;
       undoDeleteRoom();
     }
     window.addEventListener("keydown", onKey);
@@ -528,13 +556,20 @@ export default function App() {
         doc_id: d.docId, property_id: d.propertyId || null,
         metadata: d.meta, rooms: d.rooms, keyplan: d.keyplan || null,
         sheet_id: asNew ? null : (d.savedId || null), save,
+        // Bake paint into the SAVED artifact only; the live preview stays
+        // paintless (the canvas overlay shows it) so it's never double-painted.
+        paint_image: save ? (d.paintImage || null) : null,
       });
       const latest = mySeq === renderSeq.current[d.id];
+      // A save bakes paint into res.svg; swapping that into the preview would
+      // double-paint over the live canvas, so keep the paintless preview svg.
+      const bakedPaint = save && !!d.paintImage;
       patchDoc(d.id, {
         // only the newest render may repaint the preview — an earlier response
         // resolving after a newer one must not overwrite fresher geometry
         ...(latest ? {
-          svg: res.svg, placement: res.meta || d.placement,
+          ...(bakedPaint ? {} : { svg: res.svg }),
+          placement: res.meta || d.placement,
           keyplanSvg: res.keyplan_svg || null, renderError: "",
         } : {}),
         // a completed save is a committed server action: always record it, even
@@ -640,13 +675,33 @@ export default function App() {
   }
 
   // ---- export --------------------------------------------------------------
-  function downloadCurrentSvg() {
-    if (!active || !active.svg) return;
-    const blob = new Blob([active.svg], { type: "image/svg+xml" });
+  async function downloadCurrentSvg() {
+    const d = docs.find((x) => x.id === activeId);
+    if (!d || !d.svg) return;
+    let svgOut = d.svg;
+    // The live preview svg is paintless (canvas overlay shows paint); bake paint
+    // into the downloaded file via a server render, mirroring the PNG path.
+    if (d.paintImage && d.docId) {
+      setPngBusy(true);
+      try {
+        const res = await renderSheet({
+          doc_id: d.docId, property_id: d.propertyId || null,
+          metadata: d.meta, rooms: d.rooms, keyplan: d.keyplan || null,
+          paint_image: d.paintImage,
+        });
+        if (res.svg) svgOut = res.svg;
+      } catch (e) {
+        if (!handleExpiredUpload(d, e)) toast(e.message, "error");
+        setPngBusy(false);
+        return;
+      }
+      setPngBusy(false);
+    }
+    const blob = new Blob([svgOut], { type: "image/svg+xml" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${exportName(active.propertyId, active.meta.title)}.svg`;
+    a.download = `${exportName(d.propertyId, d.meta.title)}.svg`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -658,6 +713,7 @@ export default function App() {
       const res = await renderSheet({
         doc_id: d.docId, property_id: d.propertyId || null,
         metadata: d.meta, rooms: d.rooms, keyplan: d.keyplan || null, want_png: true,
+        paint_image: d.paintImage || null,
       });
       if (!res.png_b64) throw new Error("No PNG returned by the server.");
       const a = document.createElement("a");
@@ -679,6 +735,7 @@ export default function App() {
       const res = await renderSheet({
         doc_id: d.docId, property_id: d.propertyId || null,
         metadata: d.meta, rooms: d.rooms, plan_only: true, want_png: kind === "png",
+        paint_image: d.paintImage || null,
       });
       const a = document.createElement("a");
       if (kind === "png") {
@@ -708,6 +765,7 @@ export default function App() {
       d.rooms = (cfg.rooms || []).map((r) => ({ ...r }));
       d.meta = cfg.metadata || { title: "", suite: "", sf: "" };
       d.keyplan = cfg.keyplan || null;
+      d.paintImage = cfg.paint_image || null;
       d.savedId = s.sheet_id;       // re-saving overwrites this library entry
       d.fileName = `${s.title || "sheet"} (re-opened)`;
       setDocs((ds) => [...ds, d]);
@@ -1127,6 +1185,9 @@ export default function App() {
               <div className="tabs">{renderTabList()}</div>
             )}
             <div className="tabbar-right">
+              {ready && (
+                <PaintBucketButton open={!!active.paintMode} onToggle={togglePaint} />
+              )}
               <button className="btn ghost icon orient-toggle"
                 disabled={!verticalFits && tabOrient === "horizontal"}
                 onClick={() => setTabOrient(effectiveOrient === "horizontal" ? "vertical" : "horizontal")}
@@ -1210,6 +1271,18 @@ export default function App() {
           </div>
         ) : (
           <>
+            {active.svg && (
+              <div className={"paint-tools-rowwrap" + (active.paintMode ? " open" : "")}>
+                <PaintToolbar
+                  tool={paintTool} onTool={setPaintTool}
+                  color={paintColor} onColor={setPaintColor}
+                  size={paintSize} onSize={setPaintSize}
+                  palette={(properties.find((p) => p.id === active.propertyId) || {}).palette || {}}
+                  onUndo={() => paintApi.current?.undo()}
+                  onClear={() => paintApi.current?.clear()}
+                />
+              </div>
+            )}
             <div className="statusline">
               <span className="statustext">
                 {rendering ? <span className="spin">rendering…</span>
@@ -1239,6 +1312,11 @@ export default function App() {
                   title="Skinny outline walls (default) vs solid poché fill">
                   {active.meta.wall_style !== "solid" ? "✓ Skinny walls" : "Skinny walls"}
                 </button>
+                <button className={"btn ghost" + (active.meta.hide_watermark ? " active" : "")}
+                  onClick={() => patchActive((d) => ({ meta: { ...d.meta, hide_watermark: !d.meta.hide_watermark } }))}
+                  title="Hide the ghost watermark (e.g. while painting) — affects preview and export">
+                  {active.meta.hide_watermark ? "✓ No watermark" : "Watermark"}
+                </button>
                 <button className="btn ghost icon" disabled={rendering} onClick={() => doRender(false)}
                   title="Reload — re-render the preview (e.g. after editing the property's brand)">
                   {rendering ? "…" : "⟳"}
@@ -1246,8 +1324,13 @@ export default function App() {
               </div>
             </div>
             {active.svg
-              ? <LabelOverlay svg={active.svg} meta={active.placement} showHandles={active.showHandles}
-                  onMove={moveLabel} onReset={resetLabel} />
+              ? <LabelOverlay svg={active.svg} meta={active.placement}
+                  showHandles={active.showHandles && !active.paintMode}
+                  onMove={moveLabel} onReset={resetLabel}
+                  paintMode={active.paintMode}
+                  paintTool={paintTool} paintColor={paintColor} paintSize={paintSize}
+                  paintImage={active.paintImage}
+                  onPaintChange={onPaintChange} registerPaint={registerPaint} />
               : <div className="sheet" style={{ minHeight: 200 }} />}
             {active.keyplanSvg && (
               <div style={{ width: "100%", maxWidth: 760, marginTop: 18 }}>

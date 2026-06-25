@@ -742,6 +742,55 @@ select, input[type="text"] {
                0 0 6px var(--chalk), 0 0 6px var(--chalk);
 }
 
+/* ---- manual paint layer ---- */
+/* Raster paint sits above the sheet SVG but below the label handles (z-index 2).
+   pointer-events are toggled inline: auto only in paint mode, else labels work. */
+.paint-canvas { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; touch-action: none; }
+
+/* Bucket toggle sits in the stagehead, directly left of the ☰ menu; darkens
+   (selected) while the paint tools are open. */
+.paint-bucket { width: auto; padding: 6px 11px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; }
+.tabbar-right .paint-bucket.active {
+  background: var(--charcoal); color: var(--chalk); border-color: var(--charcoal);
+}
+/* The feature toolbar rolls out in its own right-aligned row beneath the
+   stagehead when paint mode is on. */
+.paint-tools-rowwrap {
+  display: flex; justify-content: flex-end;
+  max-height: 0; opacity: 0; overflow: hidden; pointer-events: none;
+  transition: max-height 200ms ease, opacity 160ms ease, margin-bottom 200ms ease;
+}
+.paint-tools-rowwrap.open { max-height: 64px; opacity: 1; pointer-events: auto; margin-bottom: 10px; }
+.paint-toolbar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 6px 12px; background: #fff;
+  border: 1px solid var(--line); border-radius: 8px;
+}
+.pt-group { display: flex; align-items: center; gap: 6px; }
+.pt-group.swatches { gap: 4px; }
+.pt-sep { width: 1px; height: 18px; background: var(--line); margin: 0 2px; flex: none; }
+.swatch {
+  width: 18px; height: 18px; border-radius: 50%; padding: 0; flex: none; cursor: pointer;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+}
+.swatch.active { box-shadow: 0 0 0 2px var(--chalk), 0 0 0 3.5px var(--ember); }
+.current-color { width: 18px; height: 18px; border-radius: 4px; border: 1px solid var(--line); display: inline-block; flex: none; }
+.eyedropper-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; padding: 0; flex: none; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 5px; background: #fff; color: var(--charcoal);
+}
+.eyedropper-btn:hover { color: var(--ember); border-color: var(--ember); }
+.tool-btn {
+  width: auto; padding: 4px 10px; font-size: 12px; white-space: nowrap; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 5px; background: #fff; color: var(--charcoal);
+}
+.tool-btn:hover { border-color: var(--ember); color: var(--ember); }
+.tool-btn.active { background: rgba(193, 127, 58, 0.14); color: var(--ember); border-color: var(--ember); }
+.tool-btn.icon { padding: 5px; width: 30px; display: inline-flex; align-items: center; justify-content: center; }
+.pt-group.size input[type="range"] { width: 88px; accent-color: var(--ember); }
+.size-readout { font-size: 11px; color: var(--muted); min-width: 30px; }
+
 /* ---- property setup modal ---- */
 .modal-backdrop {
   position: fixed;

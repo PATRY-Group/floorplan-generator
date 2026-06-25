@@ -125,6 +125,34 @@ class RenderEndpointTest(_TempDataDirs):
             do_render(RenderRequest(doc_id="gone"))
         self.assertEqual(ctx.exception.status_code, 404)
 
+    def test_paint_image_bakes_into_export(self):
+        """paint_image on the request is embedded in the rendered svg, and the
+        hide_watermark metadata flag suppresses the ghost mark."""
+        doc = self._cache_prims()
+        uri = "data:image/png;base64,PAINTBYTES"
+        out = do_render(RenderRequest(doc_id=doc,
+                                      metadata={"title": "T", "watermark": "800",
+                                                "hide_watermark": True},
+                                      paint_image=uri))
+        self.assertIn(uri, out["svg"])
+        self.assertNotIn('fill-opacity="0.07"', out["svg"])   # no text watermark
+
+
+class PaintPersistenceTest(_TempDataDirs):
+    def test_paint_survives_save_and_reopen(self):
+        doc = self._cache_prims()
+        put_property("acme", Property(id="acme", name="ACME"))
+        uri = "data:image/png;base64,PAINTBYTES"
+        out = do_render(RenderRequest(doc_id=doc, property_id="acme",
+                                      metadata={"title": "2 BED"},
+                                      paint_image=uri, save=True))
+        sid = out["sheet_id"]
+        # the saved svg artifact has the paint baked in
+        self.assertIn(uri, bytes(get_sheet_svg("acme", sid).body).decode("utf-8"))
+        # reopen returns the paint_image so the editor can restore the canvas
+        reopened = reopen_sheet("acme", sid)
+        self.assertEqual(reopened["paint_image"], uri)
+
 
 class PropertyCrudTest(_TempDataDirs):
     def test_put_get_list_delete_roundtrip(self):
