@@ -433,6 +433,16 @@ def render(prims, config):
         return "\n".join(f'<polyline points="{_pts_attr(p)}" {style}/>'
                          for p in lines if len(p) >= 2)
 
+    # ---- optional manual paint layer ---------------------------------------
+    # A flattened PNG of the user's brush/eraser strokes, painted in the editor
+    # over the live preview and baked into exports. It's a full-page image in
+    # page coords; the plan-only crop shares that coordinate space, so the same
+    # tag aligns in both the full sheet and the cropped plan-only export.
+    _paint = config.get("paint_image")
+    paint_layer_svg = (
+        f'<image href="{_paint}" x="0" y="0" width="{PAGE_W}" height="{PAGE_H}" '
+        f'preserveAspectRatio="none"/>' if _paint else "")
+
     # ---- "plan only" export: just the line drawing -------------------------
     # The bare floor plan (walls/poché/doors/glazing in WALL ink + room labels),
     # cropped tight with a transparent background — no header, footer, watermark
@@ -466,7 +476,7 @@ def render(prims, config):
             f'<svg xmlns="http://www.w3.org/2000/svg" '
             f'viewBox="{vbx:.1f} {vby:.1f} {vbw:.1f} {vbh:.1f}" font-family="{SANS}">\n'
             f'<rect x="{vbx:.1f}" y="{vby:.1f}" width="{vbw:.1f}" height="{vbh:.1f}" fill="#FFFFFF"/>\n'
-            f'{geom}\n{labels}\n</svg>'
+            f'{geom}\n{labels}\n{paint_layer_svg}\n</svg>'
         )
         out_w = min(2400, max(1000, round(vbw * 2)))
         png_bytes = render_png(bare, out_w)
@@ -492,7 +502,11 @@ def render(prims, config):
     # "2274" scales down instead of overflowing the fixed 430px size).
     wm_img = md.get("watermark_image")
     wm_cx, wm_cy = PAGE_W / 2, plan_top + plan_h / 2
-    if wm_img:
+    if md.get("hide_watermark"):
+        # Per-sheet toggle (carried in unit metadata): suppress the ghost mark so
+        # manual paint doesn't clash with it. Persists on save, restores on re-open.
+        watermark_svg = ""
+    elif wm_img:
         wm_box = 460.0
         watermark_svg = (
             f'<image href="{wm_img}" x="{wm_cx - wm_box / 2:.0f}" '
@@ -606,6 +620,7 @@ def render(prims, config):
 {polyline_group(dash_lines, f'stroke="{WALL}" stroke-width="0.6" stroke-opacity="0.35" stroke-dasharray="4 3"')}
   </g>
 {chr(10).join(room_labels)}
+  {paint_layer_svg}
   {sold_out_svg}
   <rect y="{PAGE_H-FOOTER_H}" width="{PAGE_W}" height="{FOOTER_H}" fill="{DARK}"/>
   <text x="60" y="{PAGE_H-FOOTER_H+62}" font-family="{SERIF}" font-size="40" fill="#FFFFFF">{title}</text>

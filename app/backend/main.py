@@ -411,6 +411,7 @@ class RenderRequest(BaseModel):
     sheet_id: Optional[str] = None   # overwrite this saved sheet instead of minting a new one
     want_png: bool = False   # include base64 PNG in the response (for download)
     plan_only: bool = False  # bare line drawing — no header/footer/watermark/keyplan
+    paint_image: Optional[str] = None  # PNG data-URI of the manual paint layer, baked into exports only
 
 
 def _load_prims(doc_id):
@@ -434,6 +435,7 @@ def do_render(req: RenderRequest):
     prop = load_property(req.property_id) if req.property_id else None
     config = compose_config(prop, req.metadata, req.rooms, req.palette, req.layer_map)
     config["plan_only"] = req.plan_only
+    config["paint_image"] = req.paint_image
     if req.keyplan and not req.plan_only:
         kp = dict(req.keyplan)
         kp["plate_bytes"] = _plate_bytes(kp.get("plate_id"))
@@ -484,7 +486,8 @@ def do_render(req: RenderRequest):
         # persist the editable config + geometry so the sheet can be re-opened
         _write_json(os.path.join(out, f"{sheet_id}.config.json"),
                     {"property_id": req.property_id, "metadata": req.metadata,
-                     "rooms": req.rooms, "keyplan": req.keyplan})
+                     "rooms": req.rooms, "keyplan": req.keyplan,
+                     "paint_image": req.paint_image})
         prims_src = os.path.join(UP_DIR, f"{req.doc_id}.prims.json")
         if storage.exists(prims_src):
             storage.copy(prims_src, os.path.join(out, f"{sheet_id}.prims.json"))

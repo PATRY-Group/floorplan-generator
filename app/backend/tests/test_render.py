@@ -151,6 +151,41 @@ class WatermarkTest(unittest.TestCase):
         self.assertIn("SOLD OUT", on)
         ET.fromstring(on)                            # still parseable
 
+    def test_hide_watermark_suppresses_the_mark(self):
+        """The per-sheet hide_watermark flag drops the ghost mark (text or
+        image) so manual paint doesn't clash with it."""
+        text, _, _ = render(self.prims, fx.base_render_config(
+            metadata={"title": "T", "watermark": "800", "hide_watermark": True}))
+        self.assertIsNone(self._wm_font_size(text))      # no text mark
+        img_uri = "data:image/png;base64,AAAA"
+        image, _, _ = render(self.prims, fx.base_render_config(
+            metadata={"title": "T", "watermark_image": img_uri,
+                      "hide_watermark": True}))
+        self.assertNotIn(img_uri, image)                 # no image mark either
+
+
+class PaintLayerTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.prims = parse_unit_prims()
+
+    def test_paint_image_is_embedded_when_present(self):
+        uri = "data:image/png;base64,PAINT"
+        with_paint, _, _ = render(self.prims, fx.base_render_config(paint_image=uri))
+        without, _, _ = render(self.prims, fx.base_render_config())
+        self.assertIn(uri, with_paint)                   # baked in as an <image>
+        self.assertNotIn(uri, without)
+        ET.fromstring(with_paint)                        # still well-formed
+
+    def test_plan_only_export_includes_paint(self):
+        """The plan-only crop shares the page coordinate space, so paint that
+        covers quirks in the geometry is baked into the bare export too."""
+        uri = "data:image/png;base64,PAINT"
+        cfg = fx.base_render_config(paint_image=uri)
+        cfg["plan_only"] = True
+        svg, _, _ = render(self.prims, cfg)
+        self.assertIn(uri, svg)
+
 
 class PlanOnlyTest(unittest.TestCase):
     @classmethod

@@ -1,4 +1,5 @@
 import React, { useLayoutEffect, useRef, useState, useCallback } from "react";
+import PaintCanvas from "./PaintCanvas";
 
 /**
  * Rendered sheet SVG + draggable label handles. Drag to move; click to select
@@ -6,7 +7,11 @@ import React, { useLayoutEffect, useRef, useState, useCallback } from "react";
  * auto-placement. Pixel/viewBox -> DXF conversion uses the server transform:
  *   svgX = tx + dxfX*s ;  dxfX = (svgX - tx)/s ;  dxfY = (ty - svgY)/s
  */
-export default function LabelOverlay({ svg, meta, onMove, onReset, showHandles = true }) {
+export default function LabelOverlay({
+  svg, meta, onMove, onReset, showHandles = true,
+  paintMode = false, paintTool, paintColor, paintSize,
+  paintImage = null, onPaintChange, registerPaint,
+}) {
   const wrapRef = useRef(null);
   const [scale, setScale] = useState(1);
   const [drag, setDrag] = useState(null);     // {i, x, y, sx, sy} viewBox coords
@@ -99,6 +104,16 @@ export default function LabelOverlay({ svg, meta, onMove, onReset, showHandles =
       onClick={(e) => { if (e.target === e.currentTarget) setSelected(null); }}
     >
       <div dangerouslySetInnerHTML={{ __html: svg }} />
+      <PaintCanvas
+        active={paintMode}
+        tool={paintTool}
+        color={paintColor}
+        size={paintSize}
+        initialImage={paintImage}
+        page={page}
+        onPaintChange={onPaintChange}
+        registerUndo={registerPaint}
+      />
       {showHandles && <div className="handles">
         {placements.map((p) => {
           const live = drag && drag.i === p.i ? drag : null;
