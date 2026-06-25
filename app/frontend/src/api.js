@@ -54,15 +54,6 @@ export function plateUrl(plateId) {
   return `${BASE}/plate/${plateId}`;
 }
 
-export async function tracePlate(plateId, seal, palette) {
-  const r = await fetch(BASE + "/plate/trace", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ plate_id: plateId, seal, palette }),
-  });
-  return handle(r, "Trace failed");
-}
-
 export async function extractBrand(file) {
   const fd = new FormData();
   fd.append("file", file);

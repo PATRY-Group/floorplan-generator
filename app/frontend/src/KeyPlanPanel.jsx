@@ -1,23 +1,15 @@
-import React, { useEffect, useRef, useState } from "react";
-import { uploadPlate, tracePlate, plateUrl } from "./api.js";
+import React, { useEffect, useState } from "react";
+import { uploadPlate, plateUrl } from "./api.js";
 import { toast } from "./toast.js";
 
-const clamp01 = (v) => Math.max(0, Math.min(1, v));
-
 /**
- * Optional key-plan controls: upload a floor-plate screenshot, drag a box over
- * the unit's location, pick a floor label and footer/standalone placement.
+ * Optional key-plan controls: upload (or paste) a finished key-plan image — the
+ * unit already marked on it — pick a floor label and footer/standalone
+ * placement. The backend trims the surrounding whitespace on intake, so the
+ * preview here shows the same cropped image that lands on the sheet.
  *
- * Two looks for the plate:
- *   - "traced"  -> the app auto-traces the screenshot into a clean filled
- *                  footprint silhouette (the "basic key plan" look). A seal-
- *                  strength slider tunes how aggressively wall gaps are closed.
- *   - "raw"     -> the original screenshot embedded lightened (fallback when a
- *                  busy/odd plate won't trace cleanly).
- * The box-placement picker always shows the RAW screenshot — you need the
- * interior walls to find the unit — and the box fraction maps onto either look.
- *
- * Calls onChange(keyplanConfig | null) whenever the config is complete.
+ * Calls onChange(keyplanConfig | null) whenever the config is complete (an
+ * image is the only requirement — there's no box to place anymore).
  *
  * `initial` is a previously-saved keyplan config (from re-open / session
  * restore). The panel seeds its state from it so the UI matches what will
@@ -25,32 +17,21 @@ const clamp01 = (v) => Math.max(0, Math.min(1, v));
  * and wipe the restored key plan. The panel is keyed by doc id upstream, so it
  * remounts (and re-seeds) per tab.
  */
-export default function KeyPlanPanel({ onChange, palette, initial }) {
+export default function KeyPlanPanel({ onChange, initial }) {
   const [on, setOn] = useState(!!initial);
   const [plate, setPlate] = useState(          // {plate_id, url}
     initial?.plate_id ? { plate_id: initial.plate_id, url: plateUrl(initial.plate_id) } : null);
-  const [box, setBox] = useState(initial?.box || null);   // [fx, fy, fw, fh]
   const [floor, setFloor] = useState(initial?.floor_label || "");
   const [placement, setPlacement] = useState(initial?.placement || "footer");
-  const [mode, setMode] = useState(initial?.mode || "traced");  // "traced" | "raw"
-  const [seal, setSeal] = useState(initial?.seal ?? 35);
-  const [trace, setTrace] = useState(null);    // {preview, coverage}
-  const [tracing, setTracing] = useState(false);
-  const [drag, setDrag] = useState(null);
   const [busy, setBusy] = useState(false);
-  const imgRef = useRef(null);
 
   function emit(next) {
-    const s = { on, plate, box, floor, placement, mode, seal, ...next };
-    if (s.on && s.plate && s.box) {
+    const s = { on, plate, floor, placement, ...next };
+    if (s.on && s.plate) {
       onChange({
         plate_id: s.plate.plate_id,
-        box: s.box,
         floor_label: s.floor,
         placement: s.placement,
-        north_deg: 0,
-        mode: s.mode,
-        seal: s.seal,
       });
     } else {
       onChange(null);
@@ -79,31 +60,14 @@ export default function KeyPlanPanel({ onChange, palette, initial }) {
     return () => window.removeEventListener("paste", onPaste);
   }, [on]);
 
-  // Auto-trace the plate into a footprint silhouette (debounced for the slider).
-  useEffect(() => {
-    if (!on || !plate || mode !== "traced") { setTrace(null); return; }
-    let cancelled = false;
-    setTracing(true);
-    const t = setTimeout(async () => {
-      try {
-        const r = await tracePlate(plate.plate_id, seal, palette);
-        if (!cancelled) setTrace(r);
-      } catch {
-        if (!cancelled) setTrace(null);
-      } finally {
-        if (!cancelled) setTracing(false);
-      }
-    }, 300);
-    return () => { cancelled = true; clearTimeout(t); };
-  }, [on, plate, mode, seal, palette]);
-
   async function choose(file) {
     if (!file) return;
     setBusy(true);
-    const url = URL.createObjectURL(file);
     try {
       const r = await uploadPlate(file);
-      const p = { plate_id: r.plate_id, url };
+      // The backend cropped the image; repaint from the served (cropped) copy
+      // so the preview matches the sheet, not the un-cropped local file.
+      const p = { plate_id: r.plate_id, url: plateUrl(r.plate_id) };
       setPlate(p);
       emit({ plate: p });
     } catch (e) {
@@ -112,43 +76,6 @@ export default function KeyPlanPanel({ onChange, palette, initial }) {
       setBusy(false);
     }
   }
-
-  function frac(e) {
-    const r = imgRef.current.getBoundingClientRect();
-    return [clamp01((e.clientX - r.left) / r.width),
-            clamp01((e.clientY - r.top) / r.height)];
-  }
-  function down(e) {
-    e.preventDefault();
-    const [x, y] = frac(e);
-    setDrag({ x0: x, y0: y, x1: x, y1: y });
-  }
-  function move(e) {
-    if (!drag) return;
-    const [x, y] = frac(e);
-    setDrag((d) => ({ ...d, x1: x, y1: y }));
-  }
-  function up() {
-    if (!drag) return;
-    const fx = Math.min(drag.x0, drag.x1), fy = Math.min(drag.y0, drag.y1);
-    const fw = Math.abs(drag.x1 - drag.x0), fh = Math.abs(drag.y1 - drag.y0);
-    setDrag(null);
-    if (fw > 0.01 && fh > 0.01) {
-      const b = [fx, fy, fw, fh];
-      setBox(b);
-      emit({ box: b });
-    }
-  }
-
-  const live = drag
-    ? [Math.min(drag.x0, drag.x1), Math.min(drag.y0, drag.y1),
-       Math.abs(drag.x1 - drag.x0), Math.abs(drag.y1 - drag.y0)]
-    : box;
-
-  // A coverage well outside this band means the trace missed (caught only walls)
-  // or over-sealed (bridged into neighbours) — nudge the user to adjust/fallback.
-  const cov = trace && typeof trace.coverage === "number" ? trace.coverage : null;
-  const covWarn = cov !== null && (cov < 0.08 || cov > 0.92);
 
   return (
     <div className="step">
@@ -160,84 +87,22 @@ export default function KeyPlanPanel({ onChange, palette, initial }) {
       {on && (
         <>
           <p className="subtle" style={{ marginTop: 0 }}>
-            Upload or paste a floor-plate screenshot, then drag a box over this
-            unit. Schematic only — approximate is fine.
+            Upload or paste a finished key-plan image (with this unit marked).
+            We'll trim the surrounding whitespace and drop it in as reference.
           </p>
           <label className="drop small">
-            {busy ? "Uploading…" : (plate ? "Replace plate image" : "Choose or paste an image (Ctrl+V)")}
+            {busy ? "Uploading…" : (plate ? "Replace key-plan image" : "Choose or paste an image (Ctrl+V)")}
             <input type="file" accept="image/*" onChange={(e) => choose(e.target.files[0])} />
           </label>
 
           {plate && (
             <>
-              <label>Look</label>
-              <div className="btnrow">
-                {[["traced", "Auto-traced plan"], ["raw", "Screenshot"]].map(([m, lbl]) => (
-                  <button key={m}
-                    className={"btn " + (mode === m ? "ember" : "ghost")}
-                    onClick={() => { setMode(m); emit({ mode: m }); }}>
-                    {lbl}
-                  </button>
-                ))}
-              </div>
-
-              {mode === "traced" && (
-                <>
-                  <label>
-                    Seal strength {tracing ? "· tracing…" : ""}
-                  </label>
-                  <input type="range" min="7" max="61" step="2" value={seal}
-                    style={{ width: "100%" }}
-                    onChange={(e) => { const v = +e.target.value; setSeal(v); emit({ seal: v }); }} />
-                  <p className="subtle" style={{ marginTop: 2 }}>
-                    Lower keeps detail; higher closes wall gaps so the floor fills
-                    in. {trace && trace.preview && (
-                      <span>If the shape looks wrong, adjust this or switch to
-                      Screenshot.</span>
-                    )}
-                  </p>
-                  {trace && trace.preview && (
-                    <div className="platepick" style={{ marginTop: 6 }}>
-                      <img src={trace.preview} alt="traced footprint"
-                        draggable={false}
-                        style={{ background: "#F7F3ED" }} />
-                    </div>
-                  )}
-                  {covWarn && (
-                    <p className="subtle" style={{ color: "#b4571f" }}>
-                      The auto-trace looks off on this plate — try the slider, or
-                      switch to Screenshot.
-                    </p>
-                  )}
-                </>
-              )}
-            </>
-          )}
-
-          {plate && (
-            <>
-              <label>Unit location</label>
-              <div
-                className="platepick"
-                ref={imgRef}
-                onPointerDown={down}
-                onPointerMove={move}
-                onPointerUp={up}
-                onPointerLeave={up}
-              >
-                <img src={plate.url} alt="floor plate" draggable={false} />
-                {live && (
-                  <div className="platebox" style={{
-                    left: `${live[0] * 100}%`, top: `${live[1] * 100}%`,
-                    width: `${live[2] * 100}%`, height: `${live[3] * 100}%`,
-                  }} />
-                )}
+              <label>Preview</label>
+              <div className="platepick">
+                <img src={plate.url} alt="key plan" draggable={false}
+                  style={{ background: "#F7F3ED" }} />
               </div>
             </>
-          )}
-
-          {plate && !box && (
-            <p className="subtle">Drag a rectangle over the unit's location.</p>
           )}
 
           <label>Floor label</label>
