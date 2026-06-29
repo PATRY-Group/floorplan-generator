@@ -78,6 +78,25 @@ SKINNY_WALL_W = 0.8   # wall-outline stroke for the "skinny" (no-fill) wall styl
 DEFAULT_SERIF = "Georgia, 'Times New Roman', serif"
 DEFAULT_SANS = "'Helvetica Neue', Helvetica, Arial, sans-serif"
 
+
+def _font_stack(value, generic):
+    """Turn a property's font value into a valid, viewer-safe CSS stack.
+
+    A brand font is stored as a bare family name (e.g. "Inter 18pt"). Emitted
+    raw into the SVG as font-family="Inter 18pt", the "18pt" tokenizes as a CSS
+    dimension, not a name — the declaration is invalid, so browsers drop it and
+    fall back to their default serif (the PNG is fine because resvg matches font
+    names leniently). Quote the family (matching the @font-face the HTTP layer
+    injects) so it parses as one name and resolves the embedded face, and append
+    a generic so a viewer that can't load the embedded font degrades to a sane
+    sans/serif instead of Times. Values that are already a stack (they contain a
+    comma — e.g. the defaults, or a user-typed CSS stack) pass through untouched."""
+    v = (value or "").strip()
+    if not v or "," in v:
+        return value or ""
+    fam = v.replace("\\", "").replace("'", "")   # mirror main._css_family
+    return f"'{fam}', {generic}"
+
 # --- bundled fallback fonts for the PNG raster --------------------------------
 # resvg can only draw glyphs for fonts it can find. Slim/serverless runtimes
 # (Vercel's Python Lambda) ship with NO system fonts, so resvg silently drops
@@ -240,8 +259,10 @@ def render(prims, config):
     # palette["wall"] for a property on a different convention.
     WALL = palette.get("wall") or "#000000"
     fonts = config.get("fonts") or {}
-    SERIF = fonts.get("serif", DEFAULT_SERIF)
-    SANS = fonts.get("sans", DEFAULT_SANS)
+    SERIF_NAME = fonts.get("serif", DEFAULT_SERIF)
+    SANS_NAME = fonts.get("sans", DEFAULT_SANS)
+    SERIF = _font_stack(SERIF_NAME, "serif")
+    SANS = _font_stack(SANS_NAME, "sans-serif")
     layer_map = config.get("layer_map") or {}
     role_of = _role_lookup(layer_map)
     drop = set(layer_map.get("drop", []))
@@ -567,7 +588,7 @@ def render(prims, config):
     # Measure the lockup in its actual font when we have the file, so the
     # divider/name spacing adapts to the font instead of a fixed-width guess.
     _disp = next((f for f in (config.get("font_faces") or [])
-                  if f.get("data") and (f.get("role") == "serif" or f.get("family") == SERIF)), None)
+                  if f.get("data") and (f.get("role") == "serif" or f.get("family") == SERIF_NAME)), None)
     if _disp:
         try:
             lockup_w = _glyph_width(_disp["data"], lockup, 44, 0)

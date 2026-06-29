@@ -27,6 +27,18 @@ DEFAULT_SERIF = "Georgia, 'Times New Roman', serif"
 DEFAULT_SANS = "'Helvetica Neue', Helvetica, Arial, sans-serif"
 
 
+def _font_stack(value, generic):
+    """Quote a bare brand family name into a valid CSS stack (see the twin in
+    render.py for the full rationale): unquoted, a name like "Inter 18pt" is
+    invalid CSS and browsers fall back to serif, while the PNG renders fine.
+    Values already containing a comma (a stack) pass through untouched."""
+    v = (value or "").strip()
+    if not v or "," in v:
+        return value or ""
+    fam = v.replace("\\", "").replace("'", "")
+    return f"'{fam}', {generic}"
+
+
 def img_size(plate_bytes):
     try:
         im = Image.open(io.BytesIO(plate_bytes))
@@ -106,8 +118,8 @@ def render_keyplan_sheet(config):
     mid = palette.get("mid", "#E8D9C0")
     light = palette.get("light", "#F7F3ED")
     fonts = config.get("fonts") or {}
-    serif = fonts.get("serif", DEFAULT_SERIF)
-    sans = fonts.get("sans", DEFAULT_SANS)
+    serif = _font_stack(fonts.get("serif", DEFAULT_SERIF), "serif")
+    sans = _font_stack(fonts.get("sans", DEFAULT_SANS), "sans-serif")
 
     meta = config.get("metadata") or {}
     kp = config.get("keyplan") or {}
