@@ -1,4 +1,4 @@
-import React, { useLayoutEffect, useRef, useState, useCallback } from "react";
+import React, { useLayoutEffect, useEffect, useRef, useState, useCallback } from "react";
 import PaintCanvas from "./PaintCanvas";
 
 /**
@@ -6,13 +6,21 @@ import PaintCanvas from "./PaintCanvas";
  * and nudge with arrow keys (1 viewBox px, Shift = 10). Double-click resets to
  * auto-placement. Pixel/viewBox -> DXF conversion uses the server transform:
  *   svgX = tx + dxfX*s ;  dxfX = (svgX - tx)/s ;  dxfY = (ty - svgY)/s
+ *
+ * Zoom is width-based: the inner host is sized to `zoom * 100%` inside a
+ * scrolling viewport. Everything keys off the host's measured clientWidth
+ * (label `scale`) / getBoundingClientRect (paint coords), so zooming "just
+ * works" for both labels and paint without touching stored coordinates. A
+ * CSS transform would break this (it doesn't change clientWidth).
  */
 export default function LabelOverlay({
   svg, meta, onMove, onReset, showHandles = true,
   paintMode = false, paintTool, paintColor, paintSize,
   paintImage = null, onPaintChange, registerPaint,
+  zoom = 1, onZoom,
 }) {
   const wrapRef = useRef(null);
+  const viewportRef = useRef(null);
   const [scale, setScale] = useState(1);
   const [drag, setDrag] = useState(null);     // {i, x, y, sx, sy} viewBox coords
   const [selected, setSelected] = useState(null);
@@ -35,6 +43,22 @@ export default function LabelOverlay({
   // Invalidate the local nudge accumulator when fresh placements arrive (a new
   // render) or a different label is selected, so it never positions from stale base.
   useLayoutEffect(() => { setPending(null); }, [meta, selected]);
+
+  // Ctrl/⌘ + wheel zooms the preview (plain wheel scrolls/pans the viewport).
+  // Bound natively as non-passive so we can preventDefault the browser's own
+  // page-zoom; the functional updater means we never re-bind on zoom change.
+  useEffect(() => {
+    const el = viewportRef.current;
+    if (!el || !onZoom) return undefined;
+    function onWheel(e) {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      onZoom((z) => z * factor);
+    }
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [onZoom]);
 
   function toDxf(vbx, vby) {
     const { tx, ty, s } = meta.transform;
@@ -92,17 +116,25 @@ export default function LabelOverlay({
     onMove(selected, dx, dy);
   }
 
+  const wm = meta && meta.watermark_svg;
+
   return (
-    <div
-      className="sheet overlayhost"
-      ref={wrapRef}
-      tabIndex={0}
-      onKeyDown={onKeyDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={endDrag}
-      onPointerLeave={endDrag}
-      onClick={(e) => { if (e.target === e.currentTarget) setSelected(null); }}
-    >
+    <div className="sheet-viewport" ref={viewportRef}
+      // When zoomed, cap the viewport so the oversized sheet scrolls *within* it
+      // (both axes) — that's what makes the pan tool able to move vertically too.
+      // At 100% it's uncapped, so the page scrolls a tall sheet exactly as before.
+      style={{ maxHeight: zoom > 1 ? "78vh" : undefined }}>
+      <div
+        className="overlayhost"
+        ref={wrapRef}
+        style={{ width: `${zoom * 100}%` }}
+        tabIndex={0}
+        onKeyDown={onKeyDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={endDrag}
+        onPointerLeave={endDrag}
+        onClick={(e) => { if (e.target === e.currentTarget) setSelected(null); }}
+      >
       <div dangerouslySetInnerHTML={{ __html: svg }} />
       <PaintCanvas
         active={paintMode}
@@ -114,6 +146,17 @@ export default function LabelOverlay({
         onPaintChange={onPaintChange}
         registerUndo={registerPaint}
       />
+      {/* Ghost watermark, laid above the paint canvas so the brand stays visible
+          over painted-over quirks. The live preview SVG omits it (the backend's
+          live_preview flag) precisely so it isn't drawn twice; this overlay is
+          the exact markup the export bakes inline, so preview == export. We inject
+          a FULL <svg> string into a <div> (same mechanism as the sheet itself) —
+          setting innerHTML on a bare <svg> element drops SVG-namespaced children. */}
+      {wm && (
+        <div className="wm-overlay" aria-hidden="true" dangerouslySetInnerHTML={{
+          __html: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${page.w} ${page.h}" preserveAspectRatio="xMidYMid meet">${wm}</svg>`,
+        }} />
+      )}
       {showHandles && <div className="handles">
         {placements.map((p) => {
           const live = drag && drag.i === p.i ? drag : null;
@@ -151,6 +194,7 @@ export default function LabelOverlay({
           );
         })}
       </div>}
+      </div>
     </div>
   );
 }

@@ -39,6 +39,19 @@ const EraserIcon = () => (
     <path d="m5 11 9 9" />
   </Icon>
 );
+const RectIcon = () => (
+  <Icon>
+    <rect x="3.5" y="5.5" width="17" height="13" rx="1.5" />
+  </Icon>
+);
+const HandIcon = () => (
+  <Icon>
+    <path d="M18 11V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2" />
+    <path d="M14 10V4a2 2 0 0 0-2-2a2 2 0 0 0-2 2v2" />
+    <path d="M10 10.5V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2v8" />
+    <path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15" />
+  </Icon>
+);
 const UndoIcon = () => (
   <Icon>
     <path d="M9 14 4 9l5-5" />
@@ -96,9 +109,15 @@ export default function PaintToolbar({
           onClick={() => onTool("brush")} title="Brush" aria-label="Brush"><BrushIcon /></button>
         <button type="button" className={"tool-btn icon" + (tool === "eraser" ? " active" : "")}
           onClick={() => onTool("eraser")} title="Eraser — rub out paint" aria-label="Eraser"><EraserIcon /></button>
+        <button type="button" className={"tool-btn icon" + (tool === "rect" ? " active" : "")}
+          onClick={() => onTool("rect")} title="Rectangle — click-drag to fill an area in bulk"
+          aria-label="Rectangle"><RectIcon /></button>
+        <button type="button" className={"tool-btn icon" + (tool === "pan" ? " active" : "")}
+          onClick={() => onTool("pan")} title="Pan — drag to move around when zoomed in"
+          aria-label="Pan"><HandIcon /></button>
       </div>
 
-      {tool === "brush" && (
+      {(tool === "brush" || tool === "rect") && (
         <div className="pt-group swatches">
           {NEUTRALS.map((c) => (
             <Swatch key={c} value={c} current={color} onPick={onColor} />
@@ -121,12 +140,14 @@ export default function PaintToolbar({
         </div>
       )}
 
-      <div className="pt-group size">
-        <input type="range" min="1" max="40" value={size}
-          onChange={(e) => onSize(Number(e.target.value))}
-          title={`${tool} size`} aria-label={`${tool} size`} />
-        <span className="size-readout">{size}px</span>
-      </div>
+      {(tool === "brush" || tool === "eraser") && (
+        <div className="pt-group size">
+          <input type="range" min="1" max="40" value={size}
+            onChange={(e) => onSize(Number(e.target.value))}
+            title={`${tool} size`} aria-label={`${tool} size`} />
+          <span className="size-readout">{size}px</span>
+        </div>
+      )}
 
       <div className="pt-group">
         <button type="button" className="tool-btn icon" onClick={onUndo}

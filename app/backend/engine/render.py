@@ -500,6 +500,12 @@ def render(prims, config):
     # Centered ghost watermark behind the plan: an uploaded image if provided,
     # otherwise the text mark sized to fit the page width (so a longer mark like
     # "2274" scales down instead of overflowing the fixed 430px size).
+    # The ghost mark is composited LAST, over the plan and any manual paint, so
+    # the brand stays visible on top of painted-over quirks (it's faint, ~7%, so
+    # over an opaque blob it reads as a subtle tint). For the interactive editor
+    # the watermark is omitted from the SVG (config["live_preview"]) and returned
+    # in meta so the frontend can lay it above the paint <canvas>; baked exports
+    # keep it inline. Both routes use this exact markup, so preview == export.
     wm_img = md.get("watermark_image")
     wm_cx, wm_cy = PAGE_W / 2, plan_top + plan_h / 2
     if md.get("hide_watermark"):
@@ -521,8 +527,8 @@ def render(prims, config):
     else:
         watermark_svg = ""
     # Optional "SOLD OUT" status stamp: a bold centered diagonal mark laid *on
-    # top of* the finished plan and labels (unlike the ghost brand watermark
-    # above, which sits behind everything). Per-sheet flag carried in the unit
+    # top of everything*, including the paint layer and the ghost watermark.
+    # Per-sheet flag carried in the unit
     # metadata, so it persists on save, restores on re-open, and rides into the
     # PNG export. The bare plan_only export never reaches here, so it stays clean.
     sold_out_svg = ""
@@ -600,9 +606,13 @@ def render(prims, config):
             f'font-size="7" letter-spacing="2" fill="{MID}" '
             f'fill-opacity="0.6">{fl} &#183; SCHEMATIC, NOT TO SCALE</text>')
 
+    # In the live editor the watermark rides above the paint <canvas> as a
+    # separate overlay (see meta["watermark_svg"]); leaving it out of the SVG
+    # there avoids drawing it twice. Exports bake it inline, over the paint.
+    wm_in_doc = "" if config.get("live_preview") else watermark_svg
+
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {PAGE_W} {PAGE_H}" font-family="{SANS}">
   <rect width="{PAGE_W}" height="{PAGE_H}" fill="{LIGHT}"/>
-  {watermark_svg}
   <rect width="{PAGE_W}" height="{HEADER_H}" fill="{DARK}"/>
   <text x="{lockup_x}" y="62" font-family="{SERIF}" font-weight="bold" font-size="44" fill="{ACCENT}">{lockup}</text>
   <line x1="{divider_x:.0f}" y1="24" x2="{divider_x:.0f}" y2="68" stroke="{ACCENT}" stroke-width="1.2" stroke-opacity="0.7"/>
@@ -621,6 +631,7 @@ def render(prims, config):
   </g>
 {chr(10).join(room_labels)}
   {paint_layer_svg}
+  {wm_in_doc}
   {sold_out_svg}
   <rect y="{PAGE_H-FOOTER_H}" width="{PAGE_W}" height="{FOOTER_H}" fill="{DARK}"/>
   <text x="60" y="{PAGE_H-FOOTER_H+62}" font-family="{SERIF}" font-size="40" fill="#FFFFFF">{title}</text>
@@ -639,5 +650,8 @@ def render(prims, config):
         "page": {"w": PAGE_W, "h": PAGE_H},
         "extents": {"minx": minx, "maxx": maxx, "miny": miny, "maxy": maxy},
         "placements": placements,
+        # Ghost watermark markup, so the editor can lay it above the paint canvas
+        # (live_preview omits it from the SVG above to avoid a double draw).
+        "watermark_svg": watermark_svg,
     }
     return svg, png_bytes, meta

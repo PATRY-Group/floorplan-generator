@@ -162,6 +162,8 @@ function newDoc(propertyId) {
   };
 }
 
+const ZOOM_MIN = 1, ZOOM_MAX = 6, ZOOM_STEP = 0.5;
+
 export default function App() {
   const [caps, setCaps] = useState(null);
   const [properties, setProperties] = useState([]);
@@ -185,6 +187,15 @@ export default function App() {
   const [paintBrushSize, setPaintBrushSize] = useState(6);
   const [paintEraserSize, setPaintEraserSize] = useState(16);
   const paintApi = useRef(null);   // { undo, clear, hasPaint } registered by PaintCanvas
+
+  // Preview zoom (transient, app-level so it survives mode/tab toggles). Width-
+  // based: LabelOverlay sizes the sheet to zoom*100% inside a scrolling viewport,
+  // which keeps label + paint coordinate math correct at any magnification.
+  const [zoom, setZoomRaw] = useState(1);
+  const setZoom = useCallback((z) => setZoomRaw((prev) => {
+    const next = typeof z === "function" ? z(prev) : z;
+    return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(next * 100) / 100));
+  }), []);
 
   const [editing, setEditing] = useState(null);
   const [closeConfirm, setCloseConfirm] = useState(null);  // id of a dirty tab pending a close decision
@@ -559,16 +570,20 @@ export default function App() {
         // Bake paint into the SAVED artifact only; the live preview stays
         // paintless (the canvas overlay shows it) so it's never double-painted.
         paint_image: save ? (d.paintImage || null) : null,
+        // Live preview omits the baked watermark so the wm-overlay above the
+        // paint canvas isn't drawn twice; exports (save) bake it over the paint.
+        live_preview: !save,
       });
       const latest = mySeq === renderSeq.current[d.id];
-      // A save bakes paint into res.svg; swapping that into the preview would
-      // double-paint over the live canvas, so keep the paintless preview svg.
-      const bakedPaint = save && !!d.paintImage;
       patchDoc(d.id, {
         // only the newest render may repaint the preview — an earlier response
         // resolving after a newer one must not overwrite fresher geometry
         ...(latest ? {
-          ...(bakedPaint ? {} : { svg: res.svg }),
+          // The on-screen preview svg comes only from a non-save render: it's
+          // paintless (the canvas shows paint) and watermark-less (the overlay
+          // shows it). A save bakes both into res.svg for the library/export, so
+          // swapping it in would double the paint AND the watermark.
+          ...(save ? {} : { svg: res.svg }),
           placement: res.meta || d.placement,
           keyplanSvg: res.keyplan_svg || null, renderError: "",
         } : {}),
@@ -677,26 +692,26 @@ export default function App() {
   // ---- export --------------------------------------------------------------
   async function downloadCurrentSvg() {
     const d = docs.find((x) => x.id === activeId);
-    if (!d || !d.svg) return;
+    if (!d || !d.docId || !d.svg) return;
+    // Re-render server-side so the export bakes the full sheet: the live preview
+    // svg omits both the paint (the canvas overlay shows it) and the watermark
+    // (the wm-overlay shows it), so d.svg alone is not export-ready. Mirrors the
+    // PNG path.
     let svgOut = d.svg;
-    // The live preview svg is paintless (canvas overlay shows paint); bake paint
-    // into the downloaded file via a server render, mirroring the PNG path.
-    if (d.paintImage && d.docId) {
-      setPngBusy(true);
-      try {
-        const res = await renderSheet({
-          doc_id: d.docId, property_id: d.propertyId || null,
-          metadata: d.meta, rooms: d.rooms, keyplan: d.keyplan || null,
-          paint_image: d.paintImage,
-        });
-        if (res.svg) svgOut = res.svg;
-      } catch (e) {
-        if (!handleExpiredUpload(d, e)) toast(e.message, "error");
-        setPngBusy(false);
-        return;
-      }
+    setPngBusy(true);
+    try {
+      const res = await renderSheet({
+        doc_id: d.docId, property_id: d.propertyId || null,
+        metadata: d.meta, rooms: d.rooms, keyplan: d.keyplan || null,
+        paint_image: d.paintImage || null,
+      });
+      if (res.svg) svgOut = res.svg;
+    } catch (e) {
+      if (!handleExpiredUpload(d, e)) toast(e.message, "error");
       setPngBusy(false);
+      return;
     }
+    setPngBusy(false);
     const blob = new Blob([svgOut], { type: "image/svg+xml" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1186,6 +1201,19 @@ export default function App() {
             )}
             <div className="tabbar-right">
               {ready && (
+                <div className="zoomctl" role="group" aria-label="Zoom preview">
+                  <button className="btn ghost icon" onClick={() => setZoom((z) => z - ZOOM_STEP)}
+                    disabled={zoom <= ZOOM_MIN} title="Zoom out" aria-label="Zoom out">−</button>
+                  <button className="btn ghost zoom-pct" onClick={() => setZoom(1)}
+                    disabled={zoom === 1} title="Reset zoom to 100%" aria-label="Reset zoom">
+                    {Math.round(zoom * 100)}%
+                  </button>
+                  <button className="btn ghost icon" onClick={() => setZoom((z) => z + ZOOM_STEP)}
+                    disabled={zoom >= ZOOM_MAX} title="Zoom in (⌘/Ctrl + scroll to paint finer detail)"
+                    aria-label="Zoom in">+</button>
+                </div>
+              )}
+              {ready && (
                 <PaintBucketButton open={!!active.paintMode} onToggle={togglePaint} />
               )}
               <button className="btn ghost icon orient-toggle"
@@ -1288,7 +1316,7 @@ export default function App() {
                 {rendering ? <span className="spin">rendering…</span>
                   : active.renderError ? <span style={{ color: "#8a3d28" }}>{active.renderError}</span>
                   : active.showHandles
-                    ? "Live preview — drag to move a label, double-click to reset. Click “Hide labels” to hide the edit icons."
+                    ? "Live preview — double-click to reset labels."
                     : "Labels hidden. Click “Show labels” to move labels again."}
               </span>
               <div className="actions-right">
@@ -1327,6 +1355,7 @@ export default function App() {
               ? <LabelOverlay svg={active.svg} meta={active.placement}
                   showHandles={active.showHandles && !active.paintMode}
                   onMove={moveLabel} onReset={resetLabel}
+                  zoom={zoom} onZoom={setZoom}
                   paintMode={active.paintMode}
                   paintTool={paintTool} paintColor={paintColor} paintSize={paintSize}
                   paintImage={active.paintImage}

@@ -696,7 +696,27 @@ select, input[type="text"] {
 .spin { font-size: 12px; color: var(--ember); }
 
 /* ---- draggable label overlay ---- */
-.overlayhost { position: relative; }
+/* The sheet lives in a scrolling viewport (the framed white card); the inner
+   host is sized to zoom*100% so it overflows and scrolls when magnified. Both
+   label placement (clientWidth) and paint (getBoundingClientRect) read the
+   host's real size, so coordinates stay correct at any zoom. (.sheet keeps its
+   own styles for the placeholder + standalone key-plan, which don't zoom.) */
+.stage .sheet-viewport {
+  width: 100%;
+  max-width: 760px;
+  background: #fff;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.12);
+  border-radius: 4px;
+  overflow: auto;
+}
+.overlayhost { position: relative; overflow: hidden; }
+.overlayhost > div > svg { display: block; width: 100%; height: auto; }
+/* Zoom control in the stagehead, left of the paint tool (− 100% +); the %
+   doubles as a reset-to-100% button. ⌘/Ctrl+scroll zooms too (see LabelOverlay). */
+.zoomctl { display: inline-flex; align-items: center; gap: 2px; }
+.zoomctl .btn { width: auto; padding: 6px 10px; font-size: 15px; line-height: 1; }
+.zoomctl .zoom-pct { padding: 6px 8px; font-size: 12px; min-width: 50px;
+  text-align: center; font-variant-numeric: tabular-nums; }
 .handles { position: absolute; inset: 0; pointer-events: none; }
 /* The handle is centered on the label anchor. A 4-way move arrow marks it as
    draggable; while dragging it's replaced by the label text itself so you see
@@ -746,6 +766,17 @@ select, input[type="text"] {
 /* Raster paint sits above the sheet SVG but below the label handles (z-index 2).
    pointer-events are toggled inline: auto only in paint mode, else labels work. */
 .paint-canvas { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; touch-action: none; }
+/* Ghost watermark laid above the paint canvas (so it shows over painted-over
+   quirks), below the label handles. Faint by design; pointer-events off. */
+.wm-overlay { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; pointer-events: none; }
+/* Live rubber-band box while dragging the rectangle tool (DOM-only preview; the
+   fill is committed to the canvas on release). */
+.paint-rubber {
+  position: absolute; z-index: 1; pointer-events: none;
+  border: 1.5px dashed rgba(0, 0, 0, 0.6);
+  background: rgba(0, 0, 0, 0.07);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7) inset;
+}
 
 /* Bucket toggle sits in the stagehead, directly left of the ☰ menu; darkens
    (selected) while the paint tools are open. */

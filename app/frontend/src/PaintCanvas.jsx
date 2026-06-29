@@ -1,10 +1,12 @@
-import React, { useRef, useEffect, useCallback } from "react";
+import React, { useRef, useEffect, useState, useCallback } from "react";
 
 /**
- * Manual paint layer: a raster <canvas> stacked over the sheet SVG. Brush paints
- * (source-over); eraser rubs out paint (destination-out) so the floorplan shows
- * through — MS-Paint-style, and re-painting an erased spot works because it all
- * composites in order on one bitmap.
+ * Manual paint layer: a raster <canvas> stacked over the sheet SVG. Tools:
+ *   brush  — freehand paint (source-over)
+ *   eraser — rub out paint (destination-out) so the floorplan shows through
+ *   rect   — click-drag a filled rectangle to cover spots in bulk
+ *   pan    — drag to scroll the zoomed viewport (no paint); use to move around
+ * It all composites in order on one bitmap, so re-painting an erased spot works.
  *
  * The canvas is the LIVE display in the editor; it is never baked into the live
  * preview SVG. On export (Save / PNG) App reads the latest dataURL (kept current
@@ -12,6 +14,8 @@ import React, { useRef, useEffect, useCallback } from "react";
  *
  * Backing store is page * SS so the flattened PNG is crisp at the export width
  * (SHEET_PNG_W = 2000 = PAGE_W * 2), while CSS scales it down to the preview.
+ * Pointer->backing math goes through getBoundingClientRect, so it stays correct
+ * at any zoom (the host is CSS-scaled, the backing store is not).
  */
 const SS = 2;              // supersample: backing px per viewBox unit
 const UNDO_CAP = 20;
@@ -22,10 +26,11 @@ export default function PaintCanvas({
   onPaintChange, registerUndo,
 }) {
   const canvasRef = useRef(null);
-  const drawing = useRef(false);
-  const last = useRef(null);          // last point in backing coords
+  const gesture = useRef(null);       // active pointer gesture: {kind:"draw"|"rect"|"pan", ...}
+  const last = useRef(null);          // last point in backing coords (brush/eraser)
   const undoStack = useRef([]);       // dataURL snapshots, pre-stroke
   const loaded = useRef(null);        // last dataURL we drew or emitted (round-trip guard)
+  const [rubber, setRubber] = useState(null);  // live rect drag box (css px, overlayhost space)
 
   // latest tool params + emit callback, read by handlers without re-binding
   const live = useRef({ tool, color, size, onPaintChange });
@@ -100,6 +105,21 @@ export default function PaintCanvas({
     const r = canvasRef.current.getBoundingClientRect();
     return [(e.clientX - r.left) / r.width * w, (e.clientY - r.top) / r.height * h];
   }
+  // Pointer client coords -> css px within the host (for the rubber-band div,
+  // which is positioned in the same overlayhost space the canvas fills).
+  function toCss(e) {
+    const r = canvasRef.current.getBoundingClientRect();
+    return [e.clientX - r.left, e.clientY - r.top];
+  }
+  // The scrolling viewport the host lives in — panned by the pan tool.
+  function viewport() {
+    return canvasRef.current?.closest(".sheet-viewport") || null;
+  }
+
+  function snapshot() {
+    undoStack.current.push(canvasRef.current.toDataURL("image/png"));
+    if (undoStack.current.length > UNDO_CAP) undoStack.current.shift();
+  }
 
   function stroke(c, ax, ay, bx, by) {
     const { tool: t, color: col, size: sz } = live.current;
@@ -116,20 +136,59 @@ export default function PaintCanvas({
 
   function onPointerDown(e) {
     if (!active) return;
-    const c = ctx();
-    if (!c) return;
+    const t = live.current.tool;
     e.preventDefault();
     canvasRef.current.setPointerCapture?.(e.pointerId);
-    undoStack.current.push(canvasRef.current.toDataURL("image/png"));
-    if (undoStack.current.length > UNDO_CAP) undoStack.current.shift();
-    drawing.current = true;
+
+    if (t === "pan") {
+      // Grab-scroll the viewport; no painting, no undo entry.
+      const vp = viewport();
+      gesture.current = vp
+        ? { kind: "pan", x: e.clientX, y: e.clientY, sl: vp.scrollLeft, st: vp.scrollTop }
+        : { kind: "pan" };
+      return;
+    }
+
+    const c = ctx();
+    if (!c) return;
+    snapshot();   // pre-gesture state, for undo (rect pops it again if it's a no-op)
+
+    if (t === "rect") {
+      const [bx, by] = toCanvas(e);
+      const [cx, cy] = toCss(e);
+      gesture.current = { kind: "rect", bx, by, cx, cy };
+      setRubber({ left: cx, top: cy, width: 0, height: 0 });
+      return;
+    }
+
+    gesture.current = { kind: "draw" };
     const [x, y] = toCanvas(e);
     last.current = [x, y];
     stroke(c, x, y, x, y);   // a tap leaves a dot
   }
 
   function onPointerMove(e) {
-    if (!drawing.current) return;
+    const g = gesture.current;
+    if (!g) return;
+
+    if (g.kind === "pan") {
+      const vp = viewport();
+      if (vp) {
+        vp.scrollLeft = g.sl - (e.clientX - g.x);
+        vp.scrollTop = g.st - (e.clientY - g.y);
+      }
+      return;
+    }
+
+    if (g.kind === "rect") {
+      const [cx, cy] = toCss(e);
+      setRubber({
+        left: Math.min(g.cx, cx), top: Math.min(g.cy, cy),
+        width: Math.abs(cx - g.cx), height: Math.abs(cy - g.cy),
+      });
+      return;
+    }
+
     const c = ctx();
     if (!c) return;
     const [x, y] = toCanvas(e);
@@ -139,24 +198,54 @@ export default function PaintCanvas({
   }
 
   function onPointerUp(e) {
-    if (!drawing.current) return;
-    drawing.current = false;
+    const g = gesture.current;
+    if (!g) return;
+    gesture.current = null;
     canvasRef.current?.releasePointerCapture?.(e.pointerId);
-    emit();
+
+    if (g.kind === "pan") return;
+
+    if (g.kind === "rect") {
+      setRubber(null);
+      const c = ctx();
+      const [bx, by] = toCanvas(e);
+      const x = Math.min(g.bx, bx), y = Math.min(g.by, by);
+      const rw = Math.abs(bx - g.bx), rh = Math.abs(by - g.by);
+      if (!c || rw < 2 || rh < 2) {
+        undoStack.current.pop();   // negligible drag: drop the no-op undo entry
+        return;
+      }
+      c.globalCompositeOperation = "source-over";
+      c.fillStyle = live.current.color;
+      c.fillRect(x, y, rw, rh);
+      emit();
+      return;
+    }
+
+    emit();   // draw
   }
 
+  const cursor = active ? (tool === "pan" ? "grab" : "crosshair") : "default";
+
   return (
-    <canvas
-      ref={canvasRef}
-      className="paint-canvas"
-      width={w}
-      height={h}
-      style={{ pointerEvents: active ? "auto" : "none", cursor: active ? "crosshair" : "default" }}
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      onPointerLeave={onPointerUp}
-      onPointerCancel={onPointerUp}
-    />
+    <>
+      <canvas
+        ref={canvasRef}
+        className="paint-canvas"
+        width={w}
+        height={h}
+        style={{ pointerEvents: active ? "auto" : "none", cursor }}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerLeave={onPointerUp}
+        onPointerCancel={onPointerUp}
+      />
+      {rubber && (
+        <div className="paint-rubber" style={{
+          left: rubber.left, top: rubber.top, width: rubber.width, height: rubber.height,
+        }} />
+      )}
+    </>
   );
 }

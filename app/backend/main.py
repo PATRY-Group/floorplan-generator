@@ -412,6 +412,7 @@ class RenderRequest(BaseModel):
     want_png: bool = False   # include base64 PNG in the response (for download)
     plan_only: bool = False  # bare line drawing — no header/footer/watermark/keyplan
     paint_image: Optional[str] = None  # PNG data-URI of the manual paint layer, baked into exports only
+    live_preview: bool = False  # editor preview: omit the watermark from the SVG (the frontend overlays it above the paint canvas) — exports bake it inline
 
 
 def _load_prims(doc_id):
@@ -436,6 +437,7 @@ def do_render(req: RenderRequest):
     config = compose_config(prop, req.metadata, req.rooms, req.palette, req.layer_map)
     config["plan_only"] = req.plan_only
     config["paint_image"] = req.paint_image
+    config["live_preview"] = req.live_preview
     if req.keyplan and not req.plan_only:
         kp = dict(req.keyplan)
         kp["plate_bytes"] = _plate_bytes(kp.get("plate_id"))
