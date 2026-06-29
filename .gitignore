@@ -16,3 +16,9 @@ app/frontend/dist/
 
 .vercel
 .env*
+
+# Vercel @vercel/python build scaffolding — generated locally from
+# requirements.txt (the source of truth); the deploy regenerates them remotely.
+.python-version
+pyproject.toml
+uv.lock
