@@ -7,9 +7,12 @@
 # Dropping both also trims the bundle against Vercel's function-size limit.
 fastapi>=0.110
 python-multipart>=0.0.9
-ezdxf>=1.1
-numpy>=1.24
-Pillow>=10.0
+# Major-version upper bounds (kept in sync with app/backend/requirements.txt):
+# ezdxf/numpy/Pillow majors have broken rendering before, so a fresh Vercel build
+# can't silently resolve a breaking major. uv.lock holds the exact pins.
+ezdxf>=1.1,<2
+numpy>=1.24,<3
+Pillow>=10.0,<13
 resvg-py>=0.3
 fonttools>=4.0
 PyMuPDF>=1.24
