@@ -1,0 +1,40 @@
+name: tests
+
+# Run the hermetic backend suite and a frontend build on every push / PR to main,
+# so regressions (the engine contracts, the storage/upload/XSS guards, the SVG↔DXF
+# transform) are caught automatically instead of only when a human remembers to run
+# `python -m unittest`.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app/backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -p "test_*.py"
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: app/frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
