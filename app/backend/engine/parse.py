@@ -15,6 +15,7 @@ The renderer expects the same `prims` shape the original
     block           -> originating block name (used to drop loose furniture)
 """
 
+import math
 import re
 import statistics
 from ezdxf import path as ezpath
@@ -37,6 +38,13 @@ MAX_PTS_PER_ENTITY = 8_000    # downsample a single huge polyline/spline
 # Perpendicular fan offsets (fractions of the plan span, both signs) used to
 # probe for walls around a seed point when estimating a room's W x H.
 FAN_OFFSET_FRACS = (0.015, -0.015, 0.03, -0.03)
+
+
+def _finite(pts):
+    """Drop non-finite points. A malformed DXF entity can carry NaN/inf, which
+    would otherwise propagate into the extents -> scale and emit literal
+    'nan'/'inf' into SVG coordinates, breaking the whole render."""
+    return [p for p in pts if math.isfinite(p[0]) and math.isfinite(p[1])]
 
 
 def _cap_points(pts):
@@ -324,23 +332,24 @@ def _collect_entities(entity, block_name, depth, out_geom, out_text, role_sets):
     try:
         if dxftype == "LINE":
             s, e = entity.dxf.start, entity.dxf.end
-            out_geom.append([layer, "line",
-                             [(float(s[0]), float(s[1])),
-                              (float(e[0]), float(e[1]))], block_name])
+            pts = _finite([(float(s[0]), float(s[1])),
+                           (float(e[0]), float(e[1]))])
+            if len(pts) == 2:
+                out_geom.append([layer, "line", pts, block_name])
 
         elif dxftype in ("LWPOLYLINE", "POLYLINE"):
             # LWPolyline/Polyline2d don't expose .flattening() directly (and the
             # method is absent entirely in some ezdxf versions), so go through a
             # Path — which also honours arc bulges. Without this, polyline walls
             # are silently dropped and a polyline-only export looks empty.
-            pts = _cap_points([(float(p[0]), float(p[1]))
-                               for p in ezpath.make_path(entity).flattening(FLATTEN_DIST)])
+            pts = _cap_points(_finite([(float(p[0]), float(p[1]))
+                               for p in ezpath.make_path(entity).flattening(FLATTEN_DIST)]))
             if len(pts) >= 2:
                 out_geom.append([layer, "line", pts, block_name])
 
         elif dxftype in ("ARC", "CIRCLE", "ELLIPSE", "SPLINE"):
-            pts = _cap_points([(float(p[0]), float(p[1]))
-                               for p in entity.flattening(FLATTEN_DIST)])
+            pts = _cap_points(_finite([(float(p[0]), float(p[1]))
+                               for p in entity.flattening(FLATTEN_DIST)]))
             if len(pts) >= 2:
                 out_geom.append([layer, "line", pts, block_name])
 
@@ -349,8 +358,8 @@ def _collect_entities(entity, block_name, depth, out_geom, out_text, role_sets):
             for p in entity.paths:
                 try:
                     pp = ezpath.from_hatch_boundary_path(p)
-                    poly = _cap_points([(float(v[0]), float(v[1]))
-                                        for v in pp.flattening(FLATTEN_DIST)])
+                    poly = _cap_points(_finite([(float(v[0]), float(v[1]))
+                                        for v in pp.flattening(FLATTEN_DIST)]))
                     if len(poly) >= 3:
                         polys.append(poly)
                 except Exception:

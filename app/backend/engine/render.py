@@ -17,6 +17,7 @@ import html
 import io
 import math
 import os
+import re
 
 
 # PNG is rasterized by resvg-py — a self-contained wheel (bundled Rust renderer)
@@ -92,10 +93,39 @@ def _font_stack(value, generic):
     sans/serif instead of Times. Values that are already a stack (they contain a
     comma — e.g. the defaults, or a user-typed CSS stack) pass through untouched."""
     v = (value or "").strip()
+    # Strip characters that could break out of the font-family="..." attribute or
+    # the <style> font-face block (", ', \, <, >). For a normal family name or CSS
+    # stack none of these are present, so the output is unchanged.
+    v = _sanitize_font(v)
     if not v or "," in v:
-        return value or ""
-    fam = v.replace("\\", "").replace("'", "")   # mirror main._css_family
-    return f"'{fam}', {generic}"
+        return v
+    return f"'{v}', {generic}"
+
+
+_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{3,8}$")
+_DATA_IMG_RE = re.compile(r"^data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+$")
+
+
+def _sanitize_font(value):
+    """Drop characters a font name could use to escape its attribute / style
+    context. A no-op for ordinary names and CSS stacks."""
+    return "".join(c for c in (value or "") if c not in '"\'\\<>').strip()
+
+
+def _safe_color(value, default):
+    """Accept only #hex colours. Anything else (a CSS injection attempt, or just
+    a malformed value) falls back to the default — which also keeps WALL parseable
+    by _hex() for the poché raster. Valid palette values pass through unchanged."""
+    v = (value or "").strip()
+    return v if _HEX_COLOR_RE.match(v) else default
+
+
+def _safe_data_uri(uri):
+    """Accept only a base64 image data URI; reject anything that could break out
+    of the href="..." attribute. Returns "" for an invalid/empty value so the
+    caller simply omits the image rather than emitting attacker markup."""
+    v = (uri or "").strip()
+    return v if _DATA_IMG_RE.match(v) else ""
 
 # --- bundled fallback fonts for the PNG raster --------------------------------
 # resvg can only draw glyphs for fonts it can find. Slim/serverless runtimes
@@ -251,13 +281,18 @@ def _role_lookup(layer_map):
 
 def render(prims, config):
     palette = {**DEFAULT_PALETTE, **(config.get("palette") or {})}
-    DARK, ACCENT, MID, LIGHT = (palette["dark"], palette["accent"],
-                                palette["mid"], palette["light"])
+    # Palette colours are user-supplied (property setup / render override) and
+    # interpolated into many fill=/stroke= attributes — validate them as #hex so a
+    # crafted value can't break out of the attribute (valid hex passes unchanged).
+    DARK = _safe_color(palette["dark"], DEFAULT_PALETTE["dark"])
+    ACCENT = _safe_color(palette["accent"], DEFAULT_PALETTE["accent"])
+    MID = _safe_color(palette["mid"], DEFAULT_PALETTE["mid"])
+    LIGHT = _safe_color(palette["light"], DEFAULT_PALETTE["light"])
     # The drawn floor plan (walls, poché, doors, glazing) renders in its own
     # ink — black by default — independent of the brand "dark" colour, which
     # styles the header/footer bands, watermark and labels. Overridable via
     # palette["wall"] for a property on a different convention.
-    WALL = palette.get("wall") or "#000000"
+    WALL = _safe_color(palette.get("wall"), "#000000")
     fonts = config.get("fonts") or {}
     SERIF_NAME = fonts.get("serif", DEFAULT_SERIF)
     SANS_NAME = fonts.get("sans", DEFAULT_SANS)
@@ -297,6 +332,13 @@ def render(prims, config):
     ext_y = wys or ys
     minx, maxx = min(ext_x), max(ext_x)
     miny, maxy = min(ext_y), max(ext_y)
+    # True drawn bounds over ALL kept geometry (walls + doors/glazing/swings/etc.).
+    # Scale/centering above stay wall-based so the main sheet is byte-identical to
+    # the prototype; these are used only to crop the plan_only export so geometry
+    # extending past the wall envelope (door swings, balconies) isn't clipped.
+    all_x, all_y = (wxs + xs) or [0.0], (wys + ys) or [0.0]
+    dminx, dmaxx = min(all_x), max(all_x)
+    dminy, dmaxy = min(all_y), max(all_y)
     w_in, h_in = max(maxx - minx, 1e-6), max(maxy - miny, 1e-6)
     s = min(PLAN_MAX_W / w_in, PLAN_MAX_H / h_in)
     plan_w, plan_h = w_in * s, h_in * s
@@ -367,12 +409,14 @@ def render(prims, config):
         pad = 3
         lo_x, hi_x = x1 + bw / 2, x2 - bw / 2 + 1
         lo_y, hi_y = y1 + bh / 2, y2 - bh / 2 + 1
-        if hi_x <= lo_x:
-            lo_x = hi_x = cx
-        if hi_y <= lo_y:
-            lo_y = hi_y = cy
-        for px in np.arange(lo_x, hi_x, 2):
-            for py in np.arange(lo_y, hi_y, 2):
+        # When an axis is narrower than the label (e.g. a long name in a thin
+        # room) it collapses to the centre — but still search the *other* axis for
+        # a low-occlusion spot, instead of dumping the label at the rect centre
+        # unsearched (an empty arange would skip the whole nested loop).
+        xs_search = np.arange(lo_x, hi_x, 2) if hi_x > lo_x else np.array([cx])
+        ys_search = np.arange(lo_y, hi_y, 2) if hi_y > lo_y else np.array([cy])
+        for px in xs_search:
+            for py in ys_search:
                 ov = box_sum(px - bw / 2 - pad, py - bh / 2 - pad,
                              px + bw / 2 + pad, py + bh / 2 + pad)
                 d = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
@@ -459,7 +503,7 @@ def render(prims, config):
     # over the live preview and baked into exports. It's a full-page image in
     # page coords; the plan-only crop shares that coordinate space, so the same
     # tag aligns in both the full sheet and the cropped plan-only export.
-    _paint = config.get("paint_image")
+    _paint = _safe_data_uri(config.get("paint_image"))
     paint_layer_svg = (
         f'<image href="{_paint}" x="0" y="0" width="{PAGE_W}" height="{PAGE_H}" '
         f'preserveAspectRatio="none"/>' if _paint else "")
@@ -482,9 +526,10 @@ def render(prims, config):
             "</g>"
         )
         labels = "\n".join(room_labels)
-        # crop to the plan bounds, expanded to include any labels placed at the edge
-        x0, x1 = X(minx), X(maxx)
-        y0, y1 = Y(maxy), Y(miny)
+        # crop to the full drawn bounds (not just walls, so edge door swings /
+        # balconies survive), expanded to include any labels placed at the edge
+        x0, x1 = X(dminx), X(dmaxx)
+        y0, y1 = Y(dmaxy), Y(dminy)
         for p in placements:
             x0 = min(x0, p["px"] - p["bw"] / 2); x1 = max(x1, p["px"] + p["bw"] / 2)
             y0 = min(y0, p["py"] - p["bh"] / 2); y1 = max(y1, p["py"] + p["bh"] / 2)
@@ -505,7 +550,7 @@ def render(prims, config):
         meta = {
             "transform": {"tx": round(tx, 4), "ty": round(ty, 4), "s": round(s, 6)},
             "page": {"w": round(vbw, 1), "h": round(vbh, 1)},
-            "extents": {"minx": minx, "maxx": maxx, "miny": miny, "maxy": maxy},
+            "extents": {"minx": dminx, "maxx": dmaxx, "miny": dminy, "maxy": dmaxy},
             "placements": placements,
             "plan_only": True,
         }
@@ -527,7 +572,7 @@ def render(prims, config):
     # the watermark is omitted from the SVG (config["live_preview"]) and returned
     # in meta so the frontend can lay it above the paint <canvas>; baked exports
     # keep it inline. Both routes use this exact markup, so preview == export.
-    wm_img = md.get("watermark_image")
+    wm_img = _safe_data_uri(md.get("watermark_image"))
     wm_cx, wm_cy = PAGE_W / 2, plan_top + plan_h / 2
     if md.get("hide_watermark"):
         # Per-sheet toggle (carried in unit metadata): suppress the ghost mark so
