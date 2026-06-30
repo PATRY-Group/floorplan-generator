@@ -67,29 +67,30 @@ the reasoning behind most design decisions.
 
 ## Deploying (Vercel)
 
-The app runs as a **single serverless function** on Vercel — one origin serves
-both the React UI and the `/api/*` backend. The whole thing is wired through
-[`vercel.json`](vercel.json): every route is sent to [`api/index.py`](api/index.py),
-which imports the FastAPI app from [`app/backend/main.py`](app/backend/main.py)
-and serves the pre-built frontend (`app/frontend/dist/`) as static files.
+The app deploys to Vercel from one origin. [`vercel.json`](vercel.json) wires two
+builds: the `/api/*` routes go to the FastAPI app via
+[`api/index.py`](api/index.py) (`@vercel/python`), and the React UI is **built on
+Vercel** from the root `package.json` (`@vercel/static-build` → `app/frontend/dist/`),
+with non-API routes falling back to `index.html`. The frontend `dist/` is **not**
+committed — Vercel builds it on deploy, so don't re-add it to git.
 
 **Storage.** Serverless filesystems are ephemeral, so file I/O routes through
 [`app/backend/storage.py`](app/backend/storage.py), a pluggable backend chosen at
 import: if `BLOB_READ_WRITE_TOKEN` is set it uses **Vercel Blob** (persistent,
-shared); otherwise it uses the local filesystem exactly as before. Local dev, the
-test suite, and any Docker image are untouched — only the Vercel deploy uses Blob.
+shared); otherwise it uses the local filesystem. Local dev, the test suite, and
+any Docker image are untouched — only the Vercel deploy uses Blob. As a safeguard,
+the app now **refuses to start** on a serverless host with no Blob token (rather
+than silently writing to ephemeral `/tmp` and losing the data on the next cold
+start); set `ALLOW_EPHEMERAL_STORAGE=1` to override deliberately.
 
 To deploy:
 
 ```bash
-# 1. build the frontend and force-add dist (it's gitignored for dev)
-cd app/frontend && npm run build && cd ../..
-git add app/frontend/dist -f
+# 1. in Vercel: create a Blob store and connect it to the project (injects
+#    BLOB_READ_WRITE_TOKEN automatically). Prefer a PRIVATE store — the storage
+#    layer reads blobs with the token, so a public store isn't required.
 
-# 2. in Vercel: create a Public Blob store, connect it to the project
-#    (this injects BLOB_READ_WRITE_TOKEN as an env var automatically)
-
-# 3. deploy
+# 2. deploy (Vercel builds the frontend; no manual dist commit)
 vercel --prod
 ```
 
