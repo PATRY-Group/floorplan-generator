@@ -105,7 +105,7 @@ function parsedDocFields(d, fileName) {
   return {
     fileName,
     docId: d.doc_id,
-    rooms: d.labels.map((l) => ({ ...l })),
+    rooms: d.labels.map((l) => ({ ...l, rid: uid() })),   // stable React key, survives reorder/delete
     deletedRooms: [],
     ignored: d.ignored_text || [],
     suggestions: d.suggestions || {},
@@ -202,8 +202,8 @@ export default function App() {
   const [suppress5, setSuppress5] = useState(false);       // "don't ask again for 5 min" checkbox
   const [seedLayer, setSeedLayer] = useState(null);  // detected layer_map to pre-fill a NEW property
   const [showLayerReview, setShowLayerReview] = useState(false);  // detected-layers review table expanded
-  const [openSection, setOpenSection] = useState("upload");
-  const [focusRoomIdx, setFocusRoomIdx] = useState(null);  // index of a just-added room whose name input to focus
+  const [, setOpenSection] = useState("upload");   // value is write-only (drives nothing read); keep the setter
+  const [focusRoomRid, setFocusRoomRid] = useState(null);  // rid of a just-added room whose name input to focus
 
   const [panelW, setPanelW] = useState(380);
   const [collapsed, setCollapsed] = useState(false);
@@ -217,6 +217,8 @@ export default function App() {
 
   const debounce = useRef(null);
   const renderSeq = useRef({});  // per-doc latest-wins guard (keyed by doc id) so a slow /render can't clobber a newer one for the SAME doc
+  const autosaveWarnedRef = useRef(false);  // toast at most once if autosave hits the localStorage quota
+  const previewAbort = useRef(null);  // AbortController for the in-flight live-preview render, cancelled when a newer one starts
 
   const active = docs.find((d) => d.id === activeId) || null;
   const propertyId = active ? active.propertyId : defaultProp;
@@ -261,7 +263,6 @@ export default function App() {
       setDefaultProp(initial);
       restoreSession(initial);
     }).catch(() => restoreSession(""));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function restoreSession(initialProp) {
@@ -270,6 +271,8 @@ export default function App() {
       if (s && Array.isArray(s.docs) && s.docs.length) {
         const restored = s.docs.map((d) => ({
           ...newDoc(d.propertyId || initialProp), ...d,
+          // backfill rids for sessions saved before rooms carried a stable id
+          rooms: (d.rooms || []).map((r) => (r.rid ? r : { ...r, rid: uid() })),
           svg: "", placement: null, keyplanSvg: null,
           parseError: "", renderError: "",
         }));
@@ -294,10 +297,25 @@ export default function App() {
   // Track viewport width so vertical tabs can auto-fall back to horizontal when
   // the sidebar + rail would leave the stage too narrow (see effectiveOrient).
   useEffect(() => {
-    const onResize = () => setWinW(window.innerWidth);
+    // rAF-throttle: only one width update per frame instead of re-rendering the
+    // whole root on every resize tick (the value just gates a layout fallback).
+    let raf = 0;
+    const onResize = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => { raf = 0; setWinW(window.innerWidth); });
+    };
     window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
+    return () => { window.removeEventListener("resize", onResize); if (raf) cancelAnimationFrame(raf); };
   }, []);
+
+  // Escape closes the unsaved-changes dialog (matches the Library rename input;
+  // the modal previously closed only on backdrop click or the ✕ button).
+  useEffect(() => {
+    if (!closeConfirm) return;
+    const onKey = (e) => { if (e.key === "Escape") setCloseConfirm(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [closeConfirm]);
 
   // autosave open docs (slim — geometry stays server-side, re-rendered on load).
   // Debounced: the serialize-all-docs + stringify is deferred to a quiet moment
@@ -316,7 +334,24 @@ export default function App() {
         layerInferred: d.layerInferred, layerReport: d.layerReport,
         layerRoles: d.layerRoles, layerMapUsed: d.layerMapUsed,
       }));
-      localStorage.setItem(LS_SESSION, JSON.stringify({ docs: slim, activeId }));
+      // Guard the write: paint PNGs are large data URIs and a multi-tab painted
+      // session can blow the ~5MB localStorage quota. An uncaught throw here
+      // (inside setTimeout) would silently kill autosave for the rest of the
+      // session. On failure, retry without the paint layers — keep the rest of
+      // the session restorable — and warn once that unsaved paint won't survive a
+      // reload (export to keep it). If even that fails, give up quietly.
+      try {
+        localStorage.setItem(LS_SESSION, JSON.stringify({ docs: slim, activeId }));
+      } catch (e) {
+        try {
+          const lean = slim.map((d) => ({ ...d, paintImage: null }));
+          localStorage.setItem(LS_SESSION, JSON.stringify({ docs: lean, activeId }));
+          if (!autosaveWarnedRef.current) {
+            autosaveWarnedRef.current = true;
+            toast("Session too large to fully autosave — unsaved paint won’t be restored on reload. Export to keep it.", "info");
+          }
+        } catch { /* autosave is a convenience; don't disrupt the session */ }
+      }
     }, 600);
     return () => clearTimeout(t);
   }, [docs, activeId]);
@@ -350,11 +385,11 @@ export default function App() {
   // replaces the "NEW ROOM" placeholder. Runs after the new room has rendered
   // (addRoom sets the index; the docs update and this both flush together).
   useEffect(() => {
-    if (focusRoomIdx == null) return;
-    const el = document.querySelector(`input[data-room-name="${focusRoomIdx}"]`);
+    if (focusRoomRid == null) return;
+    const el = document.querySelector(`input[data-room-name="${focusRoomRid}"]`);
     if (el) { el.focus(); el.select(); el.scrollIntoView({ block: "nearest" }); }
-    setFocusRoomIdx(null);
-  }, [focusRoomIdx]);
+    setFocusRoomRid(null);
+  }, [focusRoomRid]);
 
   // auto preview (debounced) whenever the active doc's inputs change
   useEffect(() => {
@@ -436,8 +471,12 @@ export default function App() {
     if (!file) return;
     let id = activeId;
     let prop = active ? active.propertyId : defaultProp;
-    if (!active) {                 // on the Library tab — open a fresh editor tab
-      const d = newDoc(defaultProp);
+    // Open a fresh tab when there's no active editor (Library tab) OR when the
+    // active tab holds unsaved parsed work — parsing the new file in place would
+    // silently discard those edits. (Mirrors batch upload, which always tabs.)
+    if (!active || isDirty(active)) {
+      if (active) toast("Opened in a new tab to keep your unsaved changes.", "info");
+      const d = newDoc(active ? active.propertyId : defaultProp);
       id = d.id; prop = d.propertyId;
       setDocs((ds) => [...ds, d]);
       setActiveId(d.id);
@@ -474,7 +513,7 @@ export default function App() {
       // metadata and the review table. Clear the stale preview so it repaints.
       patchDoc(active.id, {
         docId: d.doc_id,
-        rooms: d.labels.map((l) => ({ ...l })),
+        rooms: d.labels.map((l) => ({ ...l, rid: uid() })),
         deletedRooms: [],
         ignored: d.ignored_text || [],
         suggestions: d.suggestions || {},
@@ -561,6 +600,16 @@ export default function App() {
     const d = docs.find((x) => x.id === id);
     if (!d || !d.docId) return null;
     const mySeq = (renderSeq.current[d.id] = (renderSeq.current[d.id] || 0) + 1);   // claim the latest slot for THIS doc's preview output
+    // Cancel a still-in-flight live preview when a newer one starts — saves the
+    // backend the wasted render. (renderSeq already stops a stale *response* from
+    // clobbering fresher geometry; this stops the *request*.) Saves and exports
+    // run unsignalled so they always complete.
+    let signal;
+    if (!save) {
+      if (previewAbort.current) previewAbort.current.abort();
+      previewAbort.current = new AbortController();
+      signal = previewAbort.current.signal;
+    }
     if (save) setSaving(true); else setRendering(true);
     try {
       const res = await renderSheet({
@@ -573,7 +622,7 @@ export default function App() {
         // Live preview omits the baked watermark so the wm-overlay above the
         // paint canvas isn't drawn twice; exports (save) bake it over the paint.
         live_preview: !save,
-      });
+      }, signal);
       const latest = mySeq === renderSeq.current[d.id];
       patchDoc(d.id, {
         // only the newest render may repaint the preview — an earlier response
@@ -599,14 +648,17 @@ export default function App() {
       }
       return save && res.sheet_id ? res.sheet_id : null;
     } catch (e) {
+      if (e.name === "AbortError") return null;   // superseded preview — cancelled on purpose, not an error
       // surface save failures always; suppress errors from a stale preview
       if (!handleExpiredUpload(d, e) && (save || mySeq === renderSeq.current[d.id])) {
         patchDoc(d.id, { renderError: e.message });
       }
       return null;
     } finally {
-      setRendering(false);
-      setSaving(false);
+      if (save) setSaving(false);
+      // only the latest preview clears the spinner, so an aborted/superseded
+      // older request's finally can't hide "Rendering…" while the newer one runs
+      else if (mySeq === renderSeq.current[d.id]) setRendering(false);
     }
   }
 
@@ -655,6 +707,7 @@ export default function App() {
   function readdIgnored(item, i) {
     patchActive((d) => ({
       rooms: [...d.rooms, {
+        rid: uid(),
         name: item.text.toUpperCase(), dims: null,
         seed_x: item.x, seed_y: item.y, rect: null, font_scale: 1.0, show_dims: true,
       }],
@@ -669,7 +722,7 @@ export default function App() {
   // Falls back to auto-placement when no preview has rendered yet (no extents).
   function addRoom() {
     if (!active) return;
-    const i = active.rooms.length;   // index the new room will occupy
+    const rid = uid();   // stable id, also the focus target after render
     patchActive((d) => {
       const ext = d.placement && d.placement.extents;
       let x = null, y = null;
@@ -681,12 +734,12 @@ export default function App() {
       }
       return {
         rooms: [...d.rooms, {
-          name: "NEW ROOM", dims: null, seed_x: null, seed_y: null,
+          rid, name: "NEW ROOM", dims: null, seed_x: null, seed_y: null,
           rect: null, x, y, font_scale: 1.0, show_dims: true,
         }],
       };
     });
-    setFocusRoomIdx(i);
+    setFocusRoomRid(rid);
   }
 
   // ---- export --------------------------------------------------------------
@@ -740,6 +793,13 @@ export default function App() {
     } finally {
       setPngBusy(false);
     }
+  }
+  // Run the two exports in sequence so the "Rendering…" affordance stays up until
+  // both finish (firing them concurrently let whichever resolved first clear it
+  // while the other was still in flight) and we don't kick off two renders at once.
+  async function downloadCurrentBoth() {
+    await downloadCurrentSvg();
+    await downloadCurrentPng();
   }
   // Bare line drawing — no header/footer/watermark. kind: "svg" | "png".
   async function downloadPlanOnly(kind) {
@@ -1117,9 +1177,9 @@ export default function App() {
                   </p>
                 )}
                 {active.rooms.map((r, i) => (
-                  <div className="room" key={i}>
+                  <div className="room" key={r.rid}>
                     <div className="top">
-                      <input type="text" value={r.name} data-room-name={i}
+                      <input type="text" value={r.name} data-room-name={r.rid}
                         onChange={(e) => updateRoom(i, { name: e.target.value })} />
                       <button className="chip" onClick={() => removeRoom(i)}>✕</button>
                     </div>
@@ -1156,7 +1216,7 @@ export default function App() {
                     Ignored text (click to add as a room):
                     <div>
                       {active.ignored.map((t, i) => (
-                        <button className="chip" key={i} onClick={() => readdIgnored(t, i)}>
+                        <button className="chip" key={`${t.text}@${t.x},${t.y}`} onClick={() => readdIgnored(t, i)}>
                           {t.text}
                         </button>
                       ))}
@@ -1303,7 +1363,7 @@ export default function App() {
                         <button disabled={pngBusy}
                           onClick={() => { setDlOpen(false); downloadCurrentPng(); }}>PNG</button>
                         <button disabled={pngBusy}
-                          onClick={() => { setDlOpen(false); downloadCurrentSvg(); downloadCurrentPng(); }}>
+                          onClick={() => { setDlOpen(false); downloadCurrentBoth(); }}>
                           SVG + PNG
                         </button>
                         <div className="menu-sep" />
@@ -1436,7 +1496,8 @@ export default function App() {
         const name = d ? tabLabelUnique(d) : "this tab";
         return (
           <div className="modal-backdrop" onClick={() => setCloseConfirm(null)}>
-            <div className="modal" style={{ maxWidth: 460 }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal" style={{ maxWidth: 460 }} onClick={(e) => e.stopPropagation()}
+                 role="dialog" aria-modal="true" aria-label="Unsaved changes">
               <div className="modal-head">
                 <h2>Unsaved changes</h2>
                 <button className="chip" onClick={() => setCloseConfirm(null)}>✕</button>

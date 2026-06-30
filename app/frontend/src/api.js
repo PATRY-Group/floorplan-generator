@@ -34,11 +34,14 @@ export async function parseFile(file, propertyId, layerMap) {
   return handle(r, "Parse failed");
 }
 
-export async function renderSheet(payload) {
+// `signal` (optional) lets the caller cancel a superseded request — the debounced
+// live preview aborts its previous in-flight render when a newer edit fires one.
+export async function renderSheet(payload, signal) {
   const r = await fetch(BASE + "/render", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+    signal,
   });
   return handle(r, "Render failed");
 }
