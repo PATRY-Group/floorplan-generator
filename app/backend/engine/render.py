@@ -363,17 +363,36 @@ def _brand_chrome(config, palette, DARK, ACCENT, MID, LIGHT, SERIF, SERIF_NAME, 
     elif sf:
         sub_line = sf
     lockup_x = 60
-    # Measure the lockup in its actual font when we have the file, so the
-    # divider/name spacing adapts to the font instead of a fixed-width guess.
-    _disp = next((f for f in (config.get("font_faces") or [])
-                  if f.get("data") and (f.get("role") == "serif" or f.get("family") == SERIF_NAME)), None)
-    if _disp:
+    lockup_svg = ""
+    # The uploaded watermark logo can optionally double as the header mark too
+    # (property-level "logo_in_header" brand choice) — same image, two spots,
+    # so a property with a logo doesn't need a second header-only asset.
+    if md.get("logo_in_header") and wm_img:
         try:
-            lockup_w = _glyph_width(_disp["data"], lockup, 44, 0)
+            _, b64 = wm_img.split(",", 1)
+            iw, ih = img_size(base64.b64decode(b64))
+            logo_h = min(52.0, HEADER_H - 24.0)
+            lockup_w = (iw / ih * logo_h) if ih else logo_h
+            logo_y = (HEADER_H - logo_h) / 2
+            lockup_svg = (f'<image href="{wm_img}" x="{lockup_x}" y="{logo_y:.1f}" '
+                          f'width="{lockup_w:.1f}" height="{logo_h:.1f}" '
+                          f'preserveAspectRatio="xMidYMid meet"/>')
         except Exception:
+            lockup_svg = ""
+    if not lockup_svg:
+        # Measure the lockup in its actual font when we have the file, so the
+        # divider/name spacing adapts to the font instead of a fixed-width guess.
+        _disp = next((f for f in (config.get("font_faces") or [])
+                      if f.get("data") and (f.get("role") == "serif" or f.get("family") == SERIF_NAME)), None)
+        if _disp:
+            try:
+                lockup_w = _glyph_width(_disp["data"], lockup, 44, 0)
+            except Exception:
+                lockup_w = _text_w(lockup, 44, 0)
+        else:
             lockup_w = _text_w(lockup, 44, 0)
-    else:
-        lockup_w = _text_w(lockup, 44, 0)
+        lockup_svg = (f'<text x="{lockup_x}" y="62" font-family="{SERIF}" '
+                      f'font-weight="bold" font-size="44" fill="{ACCENT}">{lockup}</text>')
     divider_x = lockup_x + 12 + lockup_w
     name_x = divider_x + 20
 
@@ -413,9 +432,9 @@ def _brand_chrome(config, palette, DARK, ACCENT, MID, LIGHT, SERIF, SERIF_NAME, 
     return {
         "title": title, "sub_line": sub_line,
         "prop_name": prop_name, "location": location,
-        "lockup": lockup, "header_right": header_right,
+        "lockup_svg": lockup_svg, "header_right": header_right,
         "footer_addr": footer_addr, "disclaimer": disclaimer,
-        "lockup_x": lockup_x, "divider_x": divider_x, "name_x": name_x,
+        "divider_x": divider_x, "name_x": name_x,
         "footer_kp_svg": footer_kp_svg, "floor_label_svg": floor_label_svg,
         "addr_x": addr_x, "sold_out_svg": sold_out_svg,
         "watermark_svg": watermark_svg, "wm_in_doc": wm_in_doc,
@@ -702,16 +721,16 @@ def render(prims, config):
                        plan_top, plan_h)
     title, sub_line = ch["title"], ch["sub_line"]
     prop_name, location = ch["prop_name"], ch["location"]
-    lockup, header_right = ch["lockup"], ch["header_right"]
+    lockup_svg, header_right = ch["lockup_svg"], ch["header_right"]
     footer_addr, disclaimer = ch["footer_addr"], ch["disclaimer"]
-    lockup_x, divider_x, name_x = ch["lockup_x"], ch["divider_x"], ch["name_x"]
+    divider_x, name_x = ch["divider_x"], ch["name_x"]
     footer_kp_svg, floor_label_svg, addr_x = ch["footer_kp_svg"], ch["floor_label_svg"], ch["addr_x"]
     sold_out_svg, watermark_svg, wm_in_doc = ch["sold_out_svg"], ch["watermark_svg"], ch["wm_in_doc"]
 
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {PAGE_W} {PAGE_H}" font-family="{SANS}">
   <rect width="{PAGE_W}" height="{PAGE_H}" fill="{LIGHT}"/>
   <rect width="{PAGE_W}" height="{HEADER_H}" fill="{DARK}"/>
-  <text x="{lockup_x}" y="62" font-family="{SERIF}" font-weight="bold" font-size="44" fill="{ACCENT}">{lockup}</text>
+  {lockup_svg}
   <line x1="{divider_x:.0f}" y1="24" x2="{divider_x:.0f}" y2="68" stroke="{ACCENT}" stroke-width="1.2" stroke-opacity="0.7"/>
   <text x="{name_x:.0f}" y="50" font-size="21" letter-spacing="7" fill="#FFFFFF">{prop_name}</text>
   <text x="{name_x:.0f}" y="71" font-size="11" letter-spacing="4" fill="{MID}" fill-opacity="0.85">{location}</text>
@@ -802,9 +821,9 @@ def render_image_plan(image_bytes, config):
                        plan_top, plan_h)
     title, sub_line = ch["title"], ch["sub_line"]
     prop_name, location = ch["prop_name"], ch["location"]
-    lockup, header_right = ch["lockup"], ch["header_right"]
+    lockup_svg, header_right = ch["lockup_svg"], ch["header_right"]
     footer_addr, disclaimer = ch["footer_addr"], ch["disclaimer"]
-    lockup_x, divider_x, name_x = ch["lockup_x"], ch["divider_x"], ch["name_x"]
+    divider_x, name_x = ch["divider_x"], ch["name_x"]
     footer_kp_svg, floor_label_svg, addr_x = ch["footer_kp_svg"], ch["floor_label_svg"], ch["addr_x"]
     sold_out_svg, watermark_svg, wm_in_doc = ch["sold_out_svg"], ch["watermark_svg"], ch["wm_in_doc"]
 
@@ -814,7 +833,7 @@ def render_image_plan(image_bytes, config):
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {PAGE_W} {PAGE_H}" font-family="{SANS}">
   <rect width="{PAGE_W}" height="{PAGE_H}" fill="{LIGHT}"/>
   <rect width="{PAGE_W}" height="{HEADER_H}" fill="{DARK}"/>
-  <text x="{lockup_x}" y="62" font-family="{SERIF}" font-weight="bold" font-size="44" fill="{ACCENT}">{lockup}</text>
+  {lockup_svg}
   <line x1="{divider_x:.0f}" y1="24" x2="{divider_x:.0f}" y2="68" stroke="{ACCENT}" stroke-width="1.2" stroke-opacity="0.7"/>
   <text x="{name_x:.0f}" y="50" font-size="21" letter-spacing="7" fill="#FFFFFF">{prop_name}</text>
   <text x="{name_x:.0f}" y="71" font-size="11" letter-spacing="4" fill="{MID}" fill-opacity="0.85">{location}</text>

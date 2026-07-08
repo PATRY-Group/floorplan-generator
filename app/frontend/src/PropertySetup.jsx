@@ -82,6 +82,7 @@ export default function PropertySetup({ initial, seedLayerMap, onClose, onSaved,
     lockup: initial?.lockup || "",
     watermark: initial?.watermark || "",
     watermark_image: initial?.watermark_image || null,
+    logo_in_header: initial?.logo_in_header || false,
     footer_address: initial?.footer_address || "",
     header_right: initial?.header_right || "FLOOR PLAN",
     disclaimer:
@@ -363,6 +364,13 @@ export default function PropertySetup({ initial, seedLayerMap, onClose, onSaved,
                 </>
               )}
             </div>
+            {p.watermark_image && (
+              <label className="toggle" style={{ marginTop: 6 }}>
+                <input type="checkbox" checked={p.logo_in_header}
+                  onChange={(e) => set("logo_in_header", e.target.checked)} />
+                Also show this logo in the header (instead of the text lockup)
+              </label>
+            )}
             <label>Footer address</label>
             <input type="text" value={p.footer_address}
               onChange={(e) => set("footer_address", e.target.value)}

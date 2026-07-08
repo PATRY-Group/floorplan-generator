@@ -6,6 +6,7 @@ PNG, the coordinate transform that the drag-to-fix overlay depends on, label
 placement (override vs auto-search), palette application, watermark behaviour,
 XML escaping, and the bare 'plan_only' export path.
 """
+import base64
 import io
 import os
 import re
@@ -191,6 +192,51 @@ class WatermarkTest(unittest.TestCase):
             metadata={"title": "T", "watermark_image": img_uri,
                       "hide_watermark": True}))
         self.assertNotIn(img_uri, image)                 # no image mark either
+
+
+class LogoInHeaderTest(unittest.TestCase):
+    """The uploaded watermark logo can optionally double as the header mark
+    (property-level 'logo_in_header' brand choice) — same image, two spots."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.prims = parse_unit_prims()
+        buf = io.BytesIO()
+        Image.new("RGB", (120, 60), (200, 50, 50)).save(buf, "PNG")
+        cls.logo_uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    def test_default_is_text_lockup(self):
+        svg, _, _ = render(self.prims, fx.base_render_config(
+            metadata={"title": "T", "lockup": "300", "watermark_image": self.logo_uri}))
+        self.assertIn(">300<", svg)
+
+    def test_flag_swaps_header_text_for_the_logo_image(self):
+        on, _, _ = render(self.prims, fx.base_render_config(
+            metadata={"title": "T", "lockup": "300", "watermark_image": self.logo_uri,
+                      "logo_in_header": True}))
+        off, _, _ = render(self.prims, fx.base_render_config(
+            metadata={"title": "T", "lockup": "300", "watermark_image": self.logo_uri,
+                      "logo_in_header": False}))
+        self.assertNotIn(">300<", on)          # text lockup replaced
+        self.assertIn(">300<", off)            # default path unaffected
+        # same uploaded image used in both the header and the ghost watermark
+        self.assertEqual(on.count(self.logo_uri), 2)
+        ET.fromstring(on)                      # still well-formed
+
+    def test_flag_without_an_image_falls_back_to_text(self):
+        """No watermark_image uploaded -> the flag is a no-op, not a crash."""
+        svg, _, _ = render(self.prims, fx.base_render_config(
+            metadata={"title": "T", "lockup": "300", "logo_in_header": True}))
+        self.assertIn(">300<", svg)
+
+    def test_shared_with_render_image_plan(self):
+        """render_image_plan() uses the same _brand_chrome() helper, so an
+        image-sourced sheet gets identical header-logo behaviour."""
+        svg, _, _ = render_image_plan(fx.plate_png(), fx.base_render_config(
+            metadata={"title": "T", "lockup": "300", "watermark_image": self.logo_uri,
+                      "logo_in_header": True}))
+        self.assertNotIn(">300<", svg)
+        self.assertEqual(svg.count(self.logo_uri), 2)
 
 
 class PaintLayerTest(unittest.TestCase):

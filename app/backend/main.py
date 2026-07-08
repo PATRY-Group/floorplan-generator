@@ -181,6 +181,7 @@ def compose_config(prop, metadata, rooms, palette_override=None, layer_map_overr
         "lockup": prop.get("lockup", ""),
         "watermark": prop.get("watermark", prop.get("lockup", "")),
         "watermark_image": prop.get("watermark_image"),
+        "logo_in_header": prop.get("logo_in_header", False),
         "footer_address": prop.get("footer_address", ""),
         "header_right": prop.get("header_right", "FLOOR PLAN"),
         "disclaimer": prop.get("disclaimer"),
@@ -676,6 +677,7 @@ class Property(BaseModel):
     lockup: str = ""
     watermark: str = ""
     watermark_image: Optional[str] = None   # data URI; overrides the text watermark
+    logo_in_header: bool = False   # also show the uploaded watermark image as the header mark
     footer_address: str = ""
     header_right: str = "FLOOR PLAN"
     disclaimer: Optional[str] = None
