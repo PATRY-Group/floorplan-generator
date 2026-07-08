@@ -18,3 +18,10 @@ app/rough_work/
 .git/
 .gitignore
 **/*.md
+
+# Never bake secrets into an image (BLOB_READ_WRITE_TOKEN etc.). Harmless today
+# because the Dockerfile uses targeted COPYs, but a future `COPY . .` would leak
+# these — exclude them up front.
+**/.env
+**/.env.*
+**/.vercel/

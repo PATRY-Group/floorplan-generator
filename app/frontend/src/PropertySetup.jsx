@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { saveProperty, deleteProperty, extractBrand, fontInfo } from "./api.js";
 
 const DEFAULT_LAYER_MAP = {
@@ -290,11 +290,20 @@ export default function PropertySetup({ initial, seedLayerMap, onClose, onSaved,
     }
   }
 
+  // Escape closes the modal (was closable only via backdrop click / ✕).
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   const pal = p.palette;
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}
+           role="dialog" aria-modal="true"
+           aria-label={isNew ? "New property" : "Edit property"}>
         <div className="modal-head">
           <h2>{isNew ? "New property" : `Edit ${p.name || p.id}`}</h2>
           <button className="chip" onClick={onClose}>✕</button>

@@ -26,6 +26,7 @@ import logging
 import os
 import re
 # import shutil    # now via storage.copy / storage.rmtree
+import threading
 import time
 import uuid
 import zipfile
@@ -119,9 +120,46 @@ def _read_json(path, default=None):
 
 
 def _write_json(path, data, **dump_kw):
-    """Write JSON through the storage backend. The filesystem backend writes
-    atomically (temp + replace) so a reader never sees a truncated file."""
+    """Write JSON through the storage backend. The *filesystem* backend writes
+    atomically (temp + replace) so a reader never sees a truncated file. The Blob
+    backend (serverless) has no such guarantee and is eventually consistent — a
+    read immediately after a write can briefly miss or stale it; fine for this
+    low-traffic tool, but don't assume read-after-write here."""
     storage.write_json(path, data, **dump_kw)
+
+
+# A property's index.json is a read-modify-write hotspot: save, rename, and
+# delete all load the list, mutate it, and write it back. Starlette runs these
+# sync endpoints in a threadpool, so two concurrent edits to the SAME property
+# can interleave and drop one update (a saved sheet ends up orphaned — its files
+# on disk but missing from the library). A per-property lock serialises those
+# read-modify-write sequences; callers must re-read the index *inside* the lock.
+# (This guards the in-process race, the realistic one for this low-traffic
+# internal tool. It does not serialise across separate serverless instances —
+# that would need a distributed lock, out of scope here.)
+_index_locks: Dict[str, threading.Lock] = {}
+_index_locks_guard = threading.Lock()
+
+
+def _index_lock(prop_id):
+    with _index_locks_guard:
+        lk = _index_locks.get(prop_id)
+        if lk is None:
+            lk = _index_locks[prop_id] = threading.Lock()
+        return lk
+
+
+async def _read_capped(file, max_bytes, too_large_detail):
+    """Read an upload without buffering an oversized body. The multipart parser
+    has already spooled the body to a temp file, but reading the whole thing into
+    a `bytes` is the memory spike that can OOM a small serverless function — so
+    read at most one byte past the limit and reject if it's exceeded, instead of
+    materialising gigabytes only to measure them. (A request-body cap at the
+    platform/ASGI layer is the complete defence; this bounds the in-process cost.)"""
+    raw = await file.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise HTTPException(status_code=413, detail=too_large_detail)
+    return raw
 
 
 def load_property(prop_id):
@@ -162,7 +200,16 @@ def _plate_bytes(plate_id):
 
 
 def _css_family(fam):
-    return (fam or "").replace("\\", "").replace("'", "")
+    # Strip characters that could escape the quoted CSS family name or the
+    # surrounding <style> element (', ", \, <, >). A no-op for real family names.
+    return "".join(c for c in (fam or "") if c not in '"\'\\<>')
+
+
+# A brand font is stored as a base64 data URI (produced by /font-info). Validate
+# the shape before interpolating it into @font-face src:url(...) so a hand-crafted
+# property can't break out of the <style> block. Also guarantees b64decode below
+# gets clean input.
+_FONT_DATA_RE = re.compile(r"^data:[A-Za-z0-9.+/-]+;base64,[A-Za-z0-9+/=\s]+$")
 
 
 # Library grid thumbnails: ~600px wide stays sharp on retina-scaled cards yet is a
@@ -213,7 +260,8 @@ def _apply_custom_fonts(svg, png, font_faces, png_width=SHEET_PNG_W):
     the same resolution — otherwise a branded PNG would differ in size from an
     unbranded one (notably the plan_only export, which renders wider than the
     default 900px sheet)."""
-    faces = [f for f in (font_faces or []) if f.get("data") and f.get("family")]
+    faces = [f for f in (font_faces or [])
+             if f.get("family") and _FONT_DATA_RE.match((f.get("data") or "").strip())]
     if not faces:
         return svg, png
     style = "<style>" + "".join(
@@ -249,10 +297,8 @@ def _apply_custom_fonts(svg, png, font_faces, png_width=SHEET_PNG_W):
 async def font_info(file: UploadFile = File(...)):
     """Read a TTF/OTF font's family name (so the sheet can reference it) and
     return it embedded as a data URI to store on the property."""
-    raw = await file.read()
-    if len(raw) > 4 * 1024 * 1024:
-        raise HTTPException(status_code=413,
-                            detail="Font file too large (max 4 MB). Use a single TTF/OTF weight.")
+    raw = await _read_capped(file, 4 * 1024 * 1024,
+                             "Font file too large (max 4 MB). Use a single TTF/OTF weight.")
     ext = os.path.splitext((file.filename or "").lower())[1]
     if ext not in (".ttf", ".otf", ".ttc"):
         raise HTTPException(status_code=415, detail=(
@@ -286,7 +332,7 @@ def capabilities():
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "storage": storage.MODE}
 
 
 # --------------------------------------------------------------------------- #
@@ -307,11 +353,9 @@ async def parse(file: UploadFile = File(...), property_id: Optional[str] = Form(
         except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=422, detail=f"Bad layer_map: {exc}")
     name = (file.filename or "").lower()
-    raw = await file.read()
-    if len(raw) > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=(
-            f"File is over {MAX_UPLOAD_MB} MB. That usually means a whole-building "
-            f"or heavily-detailed export. Upload a single-unit floor plan VIEW as DXF."))
+    raw = await _read_capped(file, MAX_UPLOAD_MB * 1024 * 1024, (
+        f"File is over {MAX_UPLOAD_MB} MB. That usually means a whole-building "
+        f"or heavily-detailed export. Upload a single-unit floor plan VIEW as DXF."))
     if name.endswith(".rvt"):
         raise HTTPException(status_code=415, detail=(
             "Can't read .rvt files. Export the floor plan as a DXF VIEW from Revit "
@@ -376,9 +420,7 @@ async def parse(file: UploadFile = File(...), property_id: Optional[str] = Form(
 @app.post("/plate")
 async def upload_plate(file: UploadFile = File(...)):
     sweep_uploads()
-    raw = await file.read()
-    if len(raw) > 25 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Plate image too large (max 25 MB).")
+    raw = await _read_capped(file, 25 * 1024 * 1024, "Plate image too large (max 25 MB).")
     # The uploaded image is the finished key plan. Trim its surrounding
     # whitespace once, on intake, and store the cropped PNG — every consumer
     # (preview, footer, standalone) then sees the same tight image (WYSIWYG).
@@ -415,9 +457,7 @@ def get_plate(plate_id: str):
 # --------------------------------------------------------------------------- #
 @app.post("/extract-brand")
 async def extract_brand_file(file: UploadFile = File(...)):
-    raw = await file.read()
-    if len(raw) > 25 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Brand file too large (max 25 MB).")
+    raw = await _read_capped(file, 25 * 1024 * 1024, "Brand file too large (max 25 MB).")
     try:
         return extract_brand(raw, file.filename or "")
     except BrandError as exc:
@@ -537,17 +577,23 @@ def do_render(req: RenderRequest):
                 except OSError:
                     pass   # plate already swept — degrade gracefully, don't fail the save
                 break
-        entry = {"sheet_id": sheet_id, "title": req.metadata.get("title", ""),
-                 "suite": req.metadata.get("suite", ""),
-                 "sf": req.metadata.get("sf", ""),
-                 "keyplan": bool(keyplan_svg),
-                 "created": existing["created"] if existing else time.strftime("%Y-%m-%d %H:%M"),
-                 "updated": time.strftime("%Y-%m-%d %H:%M:%S")}  # cache-busts the library thumbnail
-        if existing:
-            sheets[sheets.index(existing)] = entry   # keep its position in the library
-        else:
-            sheets.insert(0, entry)
-        _write_json(index, sheets, indent=2, ensure_ascii=False)
+        # Serialise the index read-modify-write against a concurrent save/rename/
+        # delete on the same property, and re-read inside the lock so we extend the
+        # live list rather than the stale snapshot read above for id determination.
+        with _index_lock(req.property_id):
+            sheets = _read_json(index, [])
+            existing = next((s for s in sheets if s.get("sheet_id") == sheet_id), None)
+            entry = {"sheet_id": sheet_id, "title": req.metadata.get("title", ""),
+                     "suite": req.metadata.get("suite", ""),
+                     "sf": req.metadata.get("sf", ""),
+                     "keyplan": bool(keyplan_svg),
+                     "created": existing["created"] if existing else time.strftime("%Y-%m-%d %H:%M"),
+                     "updated": time.strftime("%Y-%m-%d %H:%M:%S")}  # cache-busts the library thumbnail
+            if existing:
+                sheets[sheets.index(existing)] = entry   # keep its position in the library
+            else:
+                sheets.insert(0, entry)
+            _write_json(index, sheets, indent=2, ensure_ascii=False)
 
     png_b64 = base64.b64encode(png).decode("ascii") if req.want_png else None
     return {"svg": svg, "keyplan_svg": keyplan_svg, "sheet_id": sheet_id,
@@ -661,12 +707,13 @@ def rename_sheet(prop_id, sheet_id, req: RenameRequest):
     index = os.path.join(d, "index.json")
     if not storage.exists(index):
         raise HTTPException(status_code=404, detail="Sheet not found.")
-    sheets = _read_json(index, [])
-    entry = next((s for s in sheets if s.get("sheet_id") == sheet_id), None)
-    if entry is None:
-        raise HTTPException(status_code=404, detail="Sheet not found.")
-    entry["title"] = title
-    _write_json(index, sheets, indent=2, ensure_ascii=False)
+    with _index_lock(prop_id):
+        sheets = _read_json(index, [])
+        entry = next((s for s in sheets if s.get("sheet_id") == sheet_id), None)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Sheet not found.")
+        entry["title"] = title
+        _write_json(index, sheets, indent=2, ensure_ascii=False)
     cfg_path = os.path.join(d, f"{sheet_id}.config.json")
     if storage.exists(cfg_path):
         cfg = _read_json(cfg_path, {})
@@ -682,7 +729,14 @@ def get_sheet_svg(prop_id, sheet_id):
     text = storage.read_text(os.path.join(SHEET_DIR, prop_id, f"{sheet_id}.svg"))
     if text is None:
         raise HTTPException(status_code=404, detail="Sheet not found.")
-    return Response(text, media_type="image/svg+xml")
+    # Defense in depth: if this SVG were ever opened as a top-level document, a
+    # restrictive CSP keeps any stray markup from executing script (the engine
+    # already escapes text and validates colours/images/fonts before embedding).
+    # Allows inline styles + data: images so the sheet itself still renders; when
+    # embedded via <img> (the library), scripts can't run regardless.
+    return Response(text, media_type="image/svg+xml", headers={
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src data:",
+        "X-Content-Type-Options": "nosniff"})
 
 
 @app.get("/sheets/{prop_id}/{sheet_id}.thumb.png")
@@ -852,9 +906,10 @@ def delete_sheet(prop_id, sheet_id):
             storage.glob(os.path.join(d, f"{sheet_id}-plate*")):
         storage.remove(fn)
     index = os.path.join(d, "index.json")
-    if storage.exists(index):
-        sheets = [s for s in _read_json(index, []) if s.get("sheet_id") != sheet_id]
-        _write_json(index, sheets, indent=2, ensure_ascii=False)
+    with _index_lock(prop_id):
+        if storage.exists(index):
+            sheets = [s for s in _read_json(index, []) if s.get("sheet_id") != sheet_id]
+            _write_json(index, sheets, indent=2, ensure_ascii=False)
     return {"deleted": sheet_id}
 
 

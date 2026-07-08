@@ -28,6 +28,26 @@ ROOT = ""  # the data dir these paths live under; set by main.py at import
 _TOKEN = os.environ.get("BLOB_READ_WRITE_TOKEN")
 USING_BLOB = bool(_TOKEN)
 
+# Fail loud instead of losing data silently. On a serverless host the only
+# writable disk is ephemeral (/tmp), wiped on every cold start — so a Vercel
+# deploy with no Blob token would *look* fine while quietly dropping every saved
+# property and sheet between requests. Detect that one case and refuse to start
+# with guidance, rather than degrading to invisible data loss. Local dev, the
+# test suite, and Docker (no VERCEL env, legitimately tokenless) are untouched;
+# set ALLOW_EPHEMERAL_STORAGE=1 to opt into throwaway storage on purpose.
+_ON_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+if _ON_SERVERLESS and not USING_BLOB and not os.environ.get("ALLOW_EPHEMERAL_STORAGE"):
+    raise RuntimeError(
+        "Serverless host detected but BLOB_READ_WRITE_TOKEN is not set. Storage "
+        "would fall back to the ephemeral filesystem and silently lose all saved "
+        "properties and sheets on the next cold start. Connect a Vercel Blob store "
+        "(it injects BLOB_READ_WRITE_TOKEN), or set ALLOW_EPHEMERAL_STORAGE=1 to "
+        "intentionally use throwaway storage."
+    )
+
+# Human-readable backend, for /health and logs.
+MODE = "blob" if USING_BLOB else ("ephemeral-fs" if _ON_SERVERLESS else "filesystem")
+
 
 def _key(path):
     """Absolute path under ROOT -> blob key (slash-separated, ROOT-relative)."""
@@ -67,10 +87,34 @@ def _blob():
     return vercel_blob
 
 
+def _blob_list_all(prefix):
+    """Every blob under `prefix`, following Vercel Blob's pagination cursor.
+    list() caps each page (~1000 blobs); without walking the cursor, a property
+    with enough saved sheets — or a busy uploads cache — would silently lose
+    everything past the first page: exists() false-negatives, glob/listdir
+    missing files, rmtree leaving orphans. One listing call per page."""
+    blobs = []
+    cursor = None
+    while True:
+        opts = {"prefix": prefix}
+        if cursor:
+            opts["cursor"] = cursor
+        res = _blob().list(opts)
+        blobs.extend(res.get("blobs", []))
+        # Tolerate either camelCase or snake_case paging fields — the vercel_blob
+        # Python SDK's exact return shape isn't pinned here, and guessing wrong
+        # would silently stop after page one (the bug we're fixing).
+        if not (res.get("hasMore") or res.get("has_more")):
+            break
+        cursor = res.get("cursor")
+        if not cursor:      # has-more but no cursor -> stop, don't loop forever
+            break
+    return blobs
+
+
 def _blob_find(key):
     """Return the blob dict whose pathname == key, or None."""
-    res = _blob().list({"prefix": key})
-    for b in res.get("blobs", []):
+    for b in _blob_list_all(key):
         if b.get("pathname") == key:
             return b
     return None
@@ -161,7 +205,7 @@ def glob(pattern):
     key_pat = _key(pattern)
     prefix = key_pat.split("*", 1)[0]
     out = []
-    for b in _blob().list({"prefix": prefix}).get("blobs", []):
+    for b in _blob_list_all(prefix):
         pn = b.get("pathname", "")
         if fnmatch.fnmatch(pn, key_pat):
             out.append(os.path.join(ROOT, pn.replace("/", os.sep)))
@@ -175,7 +219,7 @@ def listdir(path):
         return os.listdir(path) if os.path.isdir(path) else []
     prefix = _key(path).rstrip("/") + "/"
     names = set()
-    for b in _blob().list({"prefix": prefix}).get("blobs", []):
+    for b in _blob_list_all(prefix):
         rest = b.get("pathname", "")[len(prefix):]
         if rest:
             names.add(rest.split("/", 1)[0])
@@ -209,6 +253,6 @@ def rmtree(path):
         shutil.rmtree(path, ignore_errors=True)
         return
     prefix = _key(path).rstrip("/") + "/"
-    urls = [b["url"] for b in _blob().list({"prefix": prefix}).get("blobs", [])]
+    urls = [b["url"] for b in _blob_list_all(prefix)]
     if urls:
         _blob().delete(urls)

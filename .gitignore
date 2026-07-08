@@ -17,8 +17,7 @@ app/frontend/dist/
 .vercel
 .env*
 
-# Vercel @vercel/python build scaffolding — generated locally from
-# requirements.txt (the source of truth); the deploy regenerates them remotely.
-.python-version
-pyproject.toml
-uv.lock
+# uv project files are now TRACKED: uv.lock pins the exact dependency set for
+# reproducible backend builds, .python-version pins the interpreter, and
+# pyproject.toml is the project definition. (The Vercel/Docker builds still
+# install from requirements.txt, but the lock records the resolved versions.)

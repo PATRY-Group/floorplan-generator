@@ -92,7 +92,7 @@ export default function KeyPlanPanel({ onChange, initial }) {
           </p>
           <label className="drop small">
             {busy ? "Uploading…" : (plate ? "Replace key-plan image" : "Choose or paste an image (Ctrl+V)")}
-            <input type="file" accept="image/*" onChange={(e) => choose(e.target.files[0])} />
+            <input type="file" accept="image/*" onChange={(e) => { choose(e.target.files[0]); e.target.value = ""; }} />
           </label>
 
           {plate && (

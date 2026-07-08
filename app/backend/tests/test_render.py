@@ -6,11 +6,14 @@ PNG, the coordinate transform that the drag-to-fix overlay depends on, label
 placement (override vs auto-search), palette application, watermark behaviour,
 XML escaping, and the bare 'plan_only' export path.
 """
+import io
+import os
 import re
 import unittest
 import xml.etree.ElementTree as ET
 
 import numpy as np
+from PIL import Image
 
 import fixtures as fx
 from engine import render, DEFAULT_LAYER_MAP
@@ -107,6 +110,32 @@ class RenderOutputTest(unittest.TestCase):
         self.assertIn("&amp;", svg)
         self.assertIn("&lt;C&gt;", svg)
         self.assertNotIn("<C>", svg)
+
+    def test_malicious_palette_color_cannot_break_out(self):
+        """A non-#hex palette value (an attribute-breakout attempt) is dropped to
+        the default rather than emitted raw into a fill=/stroke= attribute."""
+        evil = '#fff" onload="alert(1)'
+        svg, _, _ = self.render(palette={"light": evil})
+        ET.fromstring(svg)                              # still well-formed
+        self.assertNotIn("onload", svg)
+        self.assertNotIn(evil, svg)
+        self.assertIn(DEFAULT_PALETTE["light"], svg)    # fell back to the default
+
+    def test_malicious_image_data_uri_is_dropped(self):
+        """paint_image / watermark_image that aren't clean base64 image data URIs
+        are omitted, not interpolated into an href where they could add handlers."""
+        evil = 'x" onerror="alert(1)'
+        svg, _, _ = self.render(metadata={"title": "T", "watermark_image": evil},
+                                paint_image=evil)
+        ET.fromstring(svg)
+        self.assertNotIn("onerror", svg)
+        self.assertNotIn(evil, svg)
+
+    def test_valid_image_data_uri_still_embeds(self):
+        """The sanitizer must not reject legitimate base64 image data URIs."""
+        uri = "data:image/png;base64,AAAA"
+        svg, _, _ = self.render(metadata={"title": "T", "watermark_image": uri})
+        self.assertIn(uri, svg)
 
 
 class WatermarkTest(unittest.TestCase):
@@ -307,6 +336,64 @@ class PocheSynthesisTest(unittest.TestCase):
         svg, _, _ = render(prims, cfg)
         self.assertNotIn("<image", svg)
         self.assertIn('<path d="" fill=', svg)       # hatch fill suppressed
+
+
+class FontlessHostPngTest(unittest.TestCase):
+    """The most-cited prod footgun (CLAUDE.md): on a fontless serverless host
+    resvg draws no text unless the bundled fallback fonts are supplied. We
+    simulate that host with skip_system_fonts=True (on dev, system fonts would
+    otherwise mask the bug — see memory 'resvg-font-test-technique') and assert
+    the bundled fonts make text actually rasterize, while their absence is blank.
+
+    render_png() always supplies the bundled fonts, so this asserts the
+    load-bearing fallback rather than calling render_png directly."""
+
+    SVG = ('<svg xmlns="http://www.w3.org/2000/svg" width="240" height="80" '
+           'viewBox="0 0 240 80"><rect width="240" height="80" fill="#ffffff"/>'
+           '<text x="12" y="56" font-family="Helvetica, Arial, sans-serif" '
+           'font-size="40" fill="#000000">ABCDEF</text></svg>')
+
+    def _dark_px(self, png_bytes):
+        arr = np.asarray(Image.open(io.BytesIO(png_bytes)).convert("L"))
+        return int((arr < 128).sum())
+
+    def _render(self, with_fonts):
+        import resvg_py
+        from engine.render import (_BUNDLED_FONT_FILES, _BUNDLED_SERIF_FAMILY,
+                                    _BUNDLED_SANS_FAMILY)
+        fonts = [f for f in _BUNDLED_FONT_FILES if os.path.exists(f)] if with_fonts else None
+        return bytes(resvg_py.svg_to_bytes(
+            svg_string=self.SVG, width=240, skip_system_fonts=True, font_files=fonts,
+            serif_family=_BUNDLED_SERIF_FAMILY, sans_serif_family=_BUNDLED_SANS_FAMILY,
+            font_family=_BUNDLED_SANS_FAMILY))
+
+    def test_bundled_fonts_render_text_with_no_system_fonts(self):
+        self.assertGreater(self._dark_px(self._render(with_fonts=True)), 500)
+
+    def test_without_any_fonts_text_is_blank(self):
+        # confirms the bundled fonts are what's load-bearing, not a system fallback
+        self.assertLess(self._dark_px(self._render(with_fonts=False)), 50)
+
+
+class PlanExtentsTest(unittest.TestCase):
+    """A3: geometry that extends past the wall envelope (a door swing, balcony)
+    must not be clipped by the plan_only crop. Scale/centering stay wall-based, so
+    the main sheet's extents remain wall-only."""
+
+    # walls in a 0..10 box; a door line reaching x=13 — 3 units past the wall
+    PRIMS = [["A-WALL", "line", [(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)], ""],
+             ["A-DOOR", "line", [(10, 5), (13, 5)], ""]]
+
+    def test_plan_only_extents_cover_geometry_beyond_walls(self):
+        _, _, meta = render(self.PRIMS, fx.base_render_config(
+            layer_map=DEFAULT_LAYER_MAP, plan_only=True))
+        self.assertGreaterEqual(meta["extents"]["maxx"], 13)   # door swing included
+
+    def test_main_sheet_extents_stay_wall_only(self):
+        _, _, meta = render(self.PRIMS, fx.base_render_config(
+            layer_map=DEFAULT_LAYER_MAP, metadata={"title": "T"}))
+        # the full sheet still scales/anchors to the walls (byte-identical output)
+        self.assertAlmostEqual(meta["extents"]["maxx"], 10, places=3)
 
 
 if __name__ == "__main__":

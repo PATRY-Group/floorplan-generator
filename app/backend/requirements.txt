@@ -1,10 +1,13 @@
 fastapi>=0.110
 uvicorn[standard]>=0.27
 python-multipart>=0.0.9
-ezdxf>=1.1
-numpy>=1.24
-Pillow>=10.0
-cairosvg>=2.7
-resvg-py>=0.3       # PNG renderer that embeds uploaded brand fonts (cairosvg can't)
-fonttools>=4.0     # read a font's family name on upload
+# Upper bounds on the deps whose MAJOR bumps have broken rendering for this
+# project before (ezdxf .flattening() behaviour; numpy/Pillow ABI) so a fresh
+# build can't silently pull a breaking major. uv.lock pins the exact set — track
+# it and prefer installing from the lock for fully reproducible prod builds.
+ezdxf>=1.1,<2
+numpy>=1.24,<3
+Pillow>=10.0,<13
+resvg-py>=0.3       # PNG renderer that embeds uploaded brand fonts
+fonttools>=4.0      # read a font's family name on upload
 PyMuPDF>=1.24       # PDF rasterize + embedded font names for brand extraction (AGPL)

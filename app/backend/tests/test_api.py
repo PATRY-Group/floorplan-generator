@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 
@@ -209,6 +210,35 @@ class SheetLifecycleTest(_TempDataDirs):
             reopen_sheet("acme", "nope")
         self.assertEqual(ctx.exception.status_code, 404)
 
+    def test_concurrent_saves_to_one_property_dont_lose_entries(self):
+        """Regression guard for the index.json read-modify-write race: N parallel
+        saves to the same property must all land in the library. Without the
+        per-property lock, interleaved RMW drops entries (orphaned sheets)."""
+        doc = self._cache_prims()
+        put_property("acme", Property(id="acme", name="ACME"))
+        n = 8
+        barrier = threading.Barrier(n)   # release all threads into the RMW at once
+        errors = []
+
+        def save(i):
+            try:
+                barrier.wait()
+                do_render(RenderRequest(doc_id=doc, property_id="acme",
+                                        metadata={"title": f"UNIT {i}"}, save=True))
+            except Exception as e:        # surface worker failures on the main thread
+                errors.append(e)
+
+        threads = [threading.Thread(target=save, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        listing = list_sheets("acme")
+        self.assertEqual(len(listing), n)                      # none lost
+        self.assertEqual(len({s["sheet_id"] for s in listing}), n)  # all distinct
+
 
 class SheetThumbnailTest(_TempDataDirs):
     def _save_sheet(self):
@@ -273,7 +303,10 @@ class CapabilitiesTest(unittest.TestCase):
         main.converter_available = self._saved
 
     def test_health(self):
-        self.assertEqual(health(), {"ok": True})
+        res = health()
+        self.assertTrue(res["ok"])
+        # storage mode is surfaced for observability (filesystem in the test env)
+        self.assertEqual(res["storage"], "filesystem")
 
     def test_capabilities_track_converter_presence(self):
         main.converter_available = lambda: False
