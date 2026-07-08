@@ -16,6 +16,7 @@ from PIL import Image
 
 import fixtures as fx
 from engine import keyplan_group, render_keyplan_sheet, autocrop_plate
+from engine import pdf_to_png, PdfPlanError
 
 
 class AutocropTest(unittest.TestCase):
@@ -80,6 +81,33 @@ class KeyplanSheetTest(unittest.TestCase):
         self.assertIn("SCHEMATIC KEY PLAN — NOT TO SCALE", svg)
         self.assertIn("LEVEL 3", svg)
         self.assertIn("data:image/png;base64,", svg)   # the plate is embedded
+
+
+class PdfToPngTest(unittest.TestCase):
+    """pdf_to_png rasterizes a single-page PDF for the 'finished floor plan
+    PDF' intake — print quality, not the brand.py thumbnail rasterizer."""
+
+    def test_rasterizes_single_page_to_target_size(self):
+        png = pdf_to_png(fx.pdf_bytes(pages=1, size=(400, 300)), target_max_dim=800)
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        w, h = Image.open(io.BytesIO(png)).size
+        self.assertEqual(max(w, h), 800)             # longest edge hits the target
+        self.assertAlmostEqual(w / h, 400 / 300, places=2)   # aspect preserved
+
+    def test_multi_page_pdf_is_rejected(self):
+        """A submittal PDF with extra pages must not silently rasterize page 1
+        — reject with guidance instead of guessing."""
+        with self.assertRaises(PdfPlanError) as ctx:
+            pdf_to_png(fx.pdf_bytes(pages=2))
+        self.assertIn("one page", str(ctx.exception))
+
+    def test_non_pdf_bytes_raise(self):
+        with self.assertRaises(PdfPlanError):
+            pdf_to_png(b"not a pdf")
+
+    def test_output_is_deterministic(self):
+        raw = fx.pdf_bytes()
+        self.assertEqual(pdf_to_png(raw), pdf_to_png(raw))
 
 
 if __name__ == "__main__":

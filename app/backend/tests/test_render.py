@@ -16,7 +16,7 @@ import numpy as np
 from PIL import Image
 
 import fixtures as fx
-from engine import render, DEFAULT_LAYER_MAP
+from engine import render, render_image_plan, DEFAULT_LAYER_MAP
 from engine.render import PAGE_W, PAGE_H, DEFAULT_PALETTE
 from engine.keyplan_trace import solidify_walls
 
@@ -234,6 +234,67 @@ class PlanOnlyTest(unittest.TestCase):
         # no header/footer band text, but the room label survives
         self.assertNotIn("FOR ILLUSTRATIVE PURPOSES ONLY", svg)
         self.assertIn("BEDROOM", svg)
+
+
+class RenderImagePlanTest(unittest.TestCase):
+    """render_image_plan wraps an already-finished raster plan (e.g. a
+    rasterized PDF page) in the same branded header/footer frame as render(),
+    via the shared _brand_chrome() — no walls, no room labels, one embedded
+    image instead."""
+
+    def test_full_sheet_has_chrome_and_embedded_image(self):
+        svg, png, meta = render_image_plan(fx.plate_png(), fx.base_render_config())
+        root = ET.fromstring(svg)                     # well-formed
+        self.assertEqual(root.get("viewBox"), f"0 0 {PAGE_W} {PAGE_H}")
+        self.assertEqual(meta["page"], {"w": PAGE_W, "h": PAGE_H})
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertIn("<image", svg)
+        self.assertIn("data:image/png;base64,", svg)
+        self.assertIn("2 BED", svg)                    # footer title from base_render_config
+        self.assertIn("FOR ILLUSTRATIVE PURPOSES ONLY", svg)
+        # the embedded plan area carries no border rect (unlike the footer mini-plate)
+        self.assertNotIn('stroke-width="1.1"', svg)
+
+    def test_plan_only_export_is_bare_image_no_chrome(self):
+        cfg = fx.base_render_config(plan_only=True)
+        svg, png, meta = render_image_plan(fx.plate_png(size=(200, 150)), cfg)
+        ET.fromstring(svg)
+        self.assertTrue(meta.get("plan_only"))
+        self.assertEqual(meta["page"], {"w": 200, "h": 150})
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertNotIn("FOR ILLUSTRATIVE PURPOSES ONLY", svg)
+        self.assertNotIn("2 BED", svg)
+
+    def test_watermark_and_sold_out_shared_with_render(self):
+        """The chrome helper is shared with render(), so brand behaviour
+        (watermark, sold-out stamp) is identical for an image-sourced plan."""
+        svg, _, _ = render_image_plan(fx.plate_png(), fx.base_render_config(
+            metadata={"title": "T", "watermark": "800", "sold_out": True}))
+        self.assertIn("SOLD OUT", svg)
+        self.assertIn('fill-opacity="0.07"', svg)      # text watermark mark
+
+    def test_paint_layer_is_embedded(self):
+        uri = "data:image/png;base64,PAINT"
+        svg, _, _ = render_image_plan(fx.plate_png(),
+                                      fx.base_render_config(paint_image=uri))
+        self.assertIn(uri, svg)
+
+    def test_aspect_fit_matches_render_scale_formula(self):
+        """A portrait image and a landscape image both land within the same
+        PLAN_MAX_W/PLAN_MAX_H box render() uses — this is what keeps an
+        image-sourced sheet visually consistent with a DXF-sourced one."""
+        from engine.render import PLAN_MAX_W, PLAN_MAX_H
+        wide_svg, _, _ = render_image_plan(fx.plate_png(size=(800, 100)),
+                                           fx.base_render_config())
+        tall_svg, _, _ = render_image_plan(fx.plate_png(size=(100, 800)),
+                                           fx.base_render_config())
+        for svg in (wide_svg, tall_svg):
+            m = re.search(r'<image href="data:image/png[^"]+" x="([\d.]+)" '
+                          r'y="([\d.]+)" width="([\d.]+)" height="([\d.]+)"', svg)
+            self.assertIsNotNone(m)
+            w, h = float(m.group(3)), float(m.group(4))
+            self.assertLessEqual(round(w), PLAN_MAX_W)
+            self.assertLessEqual(round(h), PLAN_MAX_H)
 
 
 class SolidifyWallsTest(unittest.TestCase):

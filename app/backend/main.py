@@ -2,6 +2,7 @@
 Floor Plan Sheet Generator — backend service.
 
   POST /parse                         DXF/DWG upload -> geometry cached + labels
+  POST /plan-pdf                      finished floor-plan PDF -> cropped image cached
   POST /plate                         floor-plate image upload (key plans)
   POST /extract-brand                 brand PDF/image -> auto palette + font hints
   POST /render                        config (+ optional key plan) -> SVG/PNG
@@ -40,7 +41,8 @@ from typing import Optional, List, Dict, Any
 from ezdxf.filemanagement import readfile
 
 from engine import (parse_dxf, ParseError, DEFAULT_LAYER_MAP, infer_layer_map,
-                    render, render_png, SHEET_PNG_W, render_keyplan_sheet, autocrop_plate,
+                    render, render_image_plan, render_png, SHEET_PNG_W,
+                    render_keyplan_sheet, autocrop_plate, pdf_to_png, PdfPlanError,
                     dwg_to_dxf, converter_available,
                     ConversionError, extract_brand, BrandError)
 import storage   # filesystem (local/Docker) or Vercel Blob, chosen by env token
@@ -453,6 +455,37 @@ def get_plate(plate_id: str):
 
 
 # --------------------------------------------------------------------------- #
+# PDF plan upload (an already-finished floor plan — no vector geometry)
+# --------------------------------------------------------------------------- #
+@app.post("/plan-pdf")
+async def upload_plan_pdf(file: UploadFile = File(...)):
+    """Intake for a PDF of an already-finished floor plan: rasterize its single
+    page, autocrop it, and mint a doc_id the same way /parse does — so /render
+    can treat it uniformly with a DXF-sourced doc from here on (see _load_doc)."""
+    sweep_uploads()
+    name = (file.filename or "").lower()
+    raw = await _read_capped(file, 25 * 1024 * 1024, "PDF too large (max 25 MB).")
+    # Extension-trust only, matching /parse's convention — bad content behind a
+    # correct extension surfaces as a 422 from pdf_to_png below, not here.
+    if not name.endswith(".pdf"):
+        raise HTTPException(status_code=415, detail="Upload a PDF of the floor plan.")
+    try:
+        png = pdf_to_png(raw)
+    except PdfPlanError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    cropped = autocrop_plate(png)
+    doc_id = uuid.uuid4().hex[:12]
+    storage.write_bytes(os.path.join(UP_DIR, f"{doc_id}.planimg.png"), cropped)
+    w = h = None
+    try:
+        from PIL import Image
+        w, h = Image.open(io.BytesIO(cropped)).size
+    except Exception:
+        pass
+    return {"doc_id": doc_id, "width": w, "height": h}
+
+
+# --------------------------------------------------------------------------- #
 # brand extraction (property setup auto-fill)
 # --------------------------------------------------------------------------- #
 @app.post("/extract-brand")
@@ -484,11 +517,15 @@ class RenderRequest(BaseModel):
 
 
 def _load_prims(doc_id):
+    """DXF-sourced geometry for doc_id, or None if this doc_id is a PDF-plan
+    upload (or expired/unknown — the caller distinguishes those)."""
     data = storage.read_json(os.path.join(UP_DIR, f"{doc_id}.prims.json"))
-    if data is None:
-        raise HTTPException(status_code=404,
-                            detail="Upload expired or not found. Re-upload the file.")
-    return data["prims"]
+    return data["prims"] if data is not None else None
+
+
+def _load_planimg(doc_id):
+    """Raster plan image for doc_id, or None if this doc_id is a DXF upload."""
+    return storage.read_bytes(os.path.join(UP_DIR, f"{doc_id}.planimg.png"))
 
 
 @app.post("/render")
@@ -501,6 +538,10 @@ def do_render(req: RenderRequest):
     if req.keyplan and req.keyplan.get("plate_id"):
         _safe_id(req.keyplan["plate_id"], "plate id")
     prims = _load_prims(req.doc_id)
+    image_bytes = None if prims is not None else _load_planimg(req.doc_id)
+    if prims is None and image_bytes is None:
+        raise HTTPException(status_code=404,
+                            detail="Upload expired or not found. Re-upload the file.")
     prop = load_property(req.property_id) if req.property_id else None
     config = compose_config(prop, req.metadata, req.rooms, req.palette, req.layer_map)
     config["plan_only"] = req.plan_only
@@ -511,7 +552,8 @@ def do_render(req: RenderRequest):
         kp["plate_bytes"] = _plate_bytes(kp.get("plate_id"))
         config["keyplan"] = kp
     try:
-        svg, png, meta = render(prims, config)
+        svg, png, meta = (render(prims, config) if prims is not None
+                          else render_image_plan(image_bytes, config))
     except (ParseError, ValueError, KeyError) as exc:
         # Bad input / config (unknown palette key, malformed geometry, …) —
         # meaningful to the user, so surface it as a 422 with the real message.
@@ -557,13 +599,17 @@ def do_render(req: RenderRequest):
         else:
             storage.remove(kp_path)   # key plan dropped since last save (no-op if absent)
         # persist the editable config + geometry so the sheet can be re-opened
+        kind = "dxf" if prims is not None else "image"
         _write_json(os.path.join(out, f"{sheet_id}.config.json"),
                     {"property_id": req.property_id, "metadata": req.metadata,
                      "rooms": req.rooms, "keyplan": req.keyplan,
-                     "paint_image": req.paint_image})
+                     "paint_image": req.paint_image, "kind": kind})
         prims_src = os.path.join(UP_DIR, f"{req.doc_id}.prims.json")
         if storage.exists(prims_src):
             storage.copy(prims_src, os.path.join(out, f"{sheet_id}.prims.json"))
+        planimg_src = os.path.join(UP_DIR, f"{req.doc_id}.planimg.png")
+        if storage.exists(planimg_src):
+            storage.copy(planimg_src, os.path.join(out, f"{sheet_id}.planimg.png"))
         # Preserve the key-plan plate image alongside the sheet. The config keeps
         # only the plate_id, and the plate lives in the sweepable uploads area — so
         # copy it in (mirroring the prims-on-save above) to survive the uploads sweep.
@@ -586,7 +632,7 @@ def do_render(req: RenderRequest):
             entry = {"sheet_id": sheet_id, "title": req.metadata.get("title", ""),
                      "suite": req.metadata.get("suite", ""),
                      "sf": req.metadata.get("sf", ""),
-                     "keyplan": bool(keyplan_svg),
+                     "keyplan": bool(keyplan_svg), "kind": kind,
                      "created": existing["created"] if existing else time.strftime("%Y-%m-%d %H:%M"),
                      "updated": time.strftime("%Y-%m-%d %H:%M:%S")}  # cache-busts the library thumbnail
             if existing:
@@ -792,16 +838,23 @@ def _zip_arcname(used, name):
 
 def _render_plan_only(prop_id, sheet_id):
     """Re-render a saved sheet as a bare plan (no header/footer/watermark) from
-    its stored config + geometry. Returns {"svg": str, "png": bytes} or None when
-    the sheet lacks the saved config/prims needed to re-render (older saves)."""
+    its stored config + geometry/image. Returns {"svg": str, "png": bytes} or
+    None when the sheet lacks the saved source needed to re-render (older
+    saves, or one whose upload expired before it could be preserved)."""
     d = os.path.join(SHEET_DIR, prop_id)
     cfg = _read_json(os.path.join(d, f"{sheet_id}.config.json"))
-    raw = _read_json(os.path.join(d, f"{sheet_id}.prims.json"))
-    if not isinstance(cfg, dict) or not isinstance(raw, dict) or "prims" not in raw:
+    if not isinstance(cfg, dict):
         return None
     config = compose_config(load_property(prop_id), cfg.get("metadata"), cfg.get("rooms"))
     config["plan_only"] = True
-    svg, png, meta = render(raw["prims"], config)
+    raw = _read_json(os.path.join(d, f"{sheet_id}.prims.json"))
+    if isinstance(raw, dict) and "prims" in raw:
+        svg, png, meta = render(raw["prims"], config)
+    else:
+        image_bytes = storage.read_bytes(os.path.join(d, f"{sheet_id}.planimg.png"))
+        if image_bytes is None:
+            return None
+        svg, png, meta = render_image_plan(image_bytes, config)
     svg, png = _apply_custom_fonts(svg, png, config.get("font_faces"), png_width=_png_width(meta))
     return {"svg": svg, "png": png}
 
@@ -866,19 +919,27 @@ def reopen_sheet(prop_id, sheet_id):
     d = os.path.join(SHEET_DIR, prop_id)
     cfg_path = os.path.join(d, f"{sheet_id}.config.json")
     prims_path = os.path.join(d, f"{sheet_id}.prims.json")
-    if not storage.exists(cfg_path) or not storage.exists(prims_path):
+    planimg_path = os.path.join(d, f"{sheet_id}.planimg.png")
+    has_prims = storage.exists(prims_path)
+    has_planimg = storage.exists(planimg_path)
+    if not storage.exists(cfg_path) or not (has_prims or has_planimg):
         raise HTTPException(
             status_code=404,
             detail="This sheet can't be re-opened — its source geometry wasn't "
-                   "saved with it. Re-upload the DXF to edit.")
+                   "saved with it. Re-upload the file to edit.")
     cfg = _read_json(cfg_path)
     if not isinstance(cfg, dict):
         raise HTTPException(
             status_code=404,
             detail="This sheet can't be re-opened — its saved config is "
-                   "unreadable. Re-upload the DXF to edit.")
+                   "unreadable. Re-upload the file to edit.")
     new_doc = uuid.uuid4().hex[:12]
-    storage.copy(prims_path, os.path.join(UP_DIR, f"{new_doc}.prims.json"))
+    if has_prims:
+        storage.copy(prims_path, os.path.join(UP_DIR, f"{new_doc}.prims.json"))
+        cfg["kind"] = "dxf"
+    else:
+        storage.copy(planimg_path, os.path.join(UP_DIR, f"{new_doc}.planimg.png"))
+        cfg["kind"] = "image"
     cfg["doc_id"] = new_doc
     # Restore the preserved key-plan plate back into uploads under the SAME
     # plate_id the config references, so GET /plate/{plate_id} resolves again and

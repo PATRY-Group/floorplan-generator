@@ -179,3 +179,21 @@ def plate_png(size=(200, 150)):
     buf = io.BytesIO()
     img.save(buf, "PNG")
     return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# Synthetic PDFs (the "finished floor plan PDF" intake)
+# --------------------------------------------------------------------------- #
+def pdf_bytes(pages=1, size=(400, 300)):
+    """A single- or multi-page PDF with a black rectangle 'wall ring' on each
+    page — enough content for pdf_to_png's rasterizer/autocrop to have
+    something non-blank to work with."""
+    import fitz  # PyMuPDF
+    w, h = size
+    doc = fitz.open()
+    for _ in range(pages):
+        page = doc.new_page(width=w, height=h)
+        page.draw_rect(fitz.Rect(20, 20, w - 20, h - 20), color=(0, 0, 0), width=6)
+    data = doc.tobytes()
+    doc.close()
+    return data

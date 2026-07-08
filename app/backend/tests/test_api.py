@@ -30,7 +30,8 @@ from main import (RenderRequest, Property, do_render, compose_config,
                   put_property, get_property, list_properties, delete_property,
                   list_sheets, reopen_sheet, delete_sheet, get_sheet_svg,
                   get_sheet_png, get_sheet_thumb, parse as parse_endpoint,
-                  _apply_custom_fonts)
+                  _apply_custom_fonts, upload_plan_pdf,
+                  DownloadRequest, download_sheets)
 
 
 class _TempDataDirs(unittest.TestCase):
@@ -61,6 +62,13 @@ class _TempDataDirs(unittest.TestCase):
         with open(os.path.join(main.UP_DIR, f"{doc_id}.prims.json"), "w",
                   encoding="utf-8") as f:
             json.dump({"prims": res["prims"], "extents": res["extents"]}, f)
+        return doc_id
+
+    def _cache_planimg(self, doc_id="imgdoc1"):
+        """Seed an image-plan upload the same way /plan-pdf would, without
+        going through PDF rasterization — a plain cropped plate PNG."""
+        with open(os.path.join(main.UP_DIR, f"{doc_id}.planimg.png"), "wb") as f:
+            f.write(fx.plate_png())
         return doc_id
 
 
@@ -138,6 +146,25 @@ class RenderEndpointTest(_TempDataDirs):
                                       paint_image=uri))
         self.assertIn(uri, out["svg"])
         self.assertNotIn('fill-opacity="0.07"', out["svg"])   # no text watermark
+
+
+class ImagePlanRenderEndpointTest(_TempDataDirs):
+    """/render on a PDF-plan doc_id (no prims.json, only planimg.png) must
+    route to render_image_plan() instead of 404ing on missing geometry."""
+
+    def test_renders_from_cached_planimg(self):
+        doc = self._cache_planimg()
+        out = do_render(RenderRequest(doc_id=doc, metadata={"title": "2 BED"},
+                                      want_png=True))
+        self.assertTrue(out["svg"].startswith("<svg"))
+        self.assertIn("<image", out["svg"])
+        self.assertIsNotNone(out["png_b64"])
+        self.assertIsNone(out["sheet_id"])
+
+    def test_neither_prims_nor_planimg_is_404(self):
+        with self.assertRaises(HTTPException) as ctx:
+            do_render(RenderRequest(doc_id="gone"))
+        self.assertEqual(ctx.exception.status_code, 404)
 
 
 class PaintPersistenceTest(_TempDataDirs):
@@ -238,6 +265,84 @@ class SheetLifecycleTest(_TempDataDirs):
         listing = list_sheets("acme")
         self.assertEqual(len(listing), n)                      # none lost
         self.assertEqual(len({s["sheet_id"] for s in listing}), n)  # all distinct
+
+
+class ImagePlanLifecycleTest(_TempDataDirs):
+    """The same save -> list -> reopen -> delete lifecycle as DXF sheets, for
+    a PDF-plan (image-kind) doc — this must not be second-class in the library
+    just because it has no vector geometry."""
+
+    def test_save_list_reopen_delete(self):
+        doc = self._cache_planimg()
+        put_property("acme", Property(id="acme", name="ACME"))
+        out = do_render(RenderRequest(doc_id=doc, property_id="acme",
+                                      metadata={"title": "PDF UNIT"}, save=True))
+        sid = out["sheet_id"]
+        self.assertIsNotNone(sid)
+
+        listing = list_sheets("acme")
+        self.assertEqual(listing[0]["sheet_id"], sid)
+        self.assertEqual(listing[0]["kind"], "image")
+        self.assertTrue(get_sheet_svg("acme", sid).body)
+        self.assertEqual(get_sheet_png("acme", sid).media_type, "image/png")
+        self.assertTrue(os.path.exists(
+            os.path.join(main.SHEET_DIR, "acme", f"{sid}.planimg.png")))
+        self.assertFalse(os.path.exists(
+            os.path.join(main.SHEET_DIR, "acme", f"{sid}.prims.json")))
+
+        # reopen copies the image back under a fresh doc_id and reports its kind
+        reopened = reopen_sheet("acme", sid)
+        self.assertEqual(reopened["kind"], "image")
+        new_doc = reopened["doc_id"]
+        self.assertNotEqual(new_doc, doc)
+        self.assertTrue(os.path.exists(
+            os.path.join(main.UP_DIR, f"{new_doc}.planimg.png")))
+        # the reopened doc renders again on its new doc_id
+        redo = do_render(RenderRequest(doc_id=new_doc, property_id="acme",
+                                       metadata=reopened["metadata"]))
+        self.assertIn("<image", redo["svg"])
+
+        delete_sheet("acme", sid)
+        self.assertEqual(list_sheets("acme"), [])
+
+    def test_dxf_sheet_reports_kind(self):
+        """A DXF-sourced save gets 'kind': 'dxf' in its library entry, the
+        counterpart of the image-kind assertion above."""
+        doc = self._cache_prims()
+        put_property("acme", Property(id="acme", name="ACME"))
+        do_render(RenderRequest(doc_id=doc, property_id="acme",
+                                metadata={"title": "DXF UNIT"}, save=True))
+        listing = list_sheets("acme")
+        self.assertEqual(listing[0]["kind"], "dxf")
+
+
+class DownloadPlanOnlyTest(_TempDataDirs):
+    """/sheets/download with plan_only re-renders each saved sheet as a bare
+    plan — must work whether the sheet's source was a DXF or a PDF plan."""
+
+    def _save(self, doc, prop_id, title):
+        put_property(prop_id, Property(id=prop_id, name=prop_id.upper()))
+        out = do_render(RenderRequest(doc_id=doc, property_id=prop_id,
+                                      metadata={"title": title}, save=True))
+        return out["sheet_id"]
+
+    def test_plan_only_zip_includes_image_sourced_sheet(self):
+        import zipfile
+        sid = self._save(self._cache_planimg(), "acme", "PDF UNIT")
+        resp = download_sheets(DownloadRequest(
+            items=[{"property_id": "acme", "sheet_id": sid}],
+            formats=["png"], plan_only=True))
+        zf = zipfile.ZipFile(io.BytesIO(resp.body))
+        self.assertEqual(len(zf.namelist()), 1)
+
+    def test_plan_only_zip_includes_dxf_sourced_sheet(self):
+        import zipfile
+        sid = self._save(self._cache_prims(), "acme2", "DXF UNIT")
+        resp = download_sheets(DownloadRequest(
+            items=[{"property_id": "acme2", "sheet_id": sid}],
+            formats=["png"], plan_only=True))
+        zf = zipfile.ZipFile(io.BytesIO(resp.body))
+        self.assertEqual(len(zf.namelist()), 1)
 
 
 class SheetThumbnailTest(_TempDataDirs):
@@ -344,6 +449,40 @@ class UploadGuardTest(_TempDataDirs):
         self.assertGreater(out["prim_count"], 0)
         self.assertTrue(os.path.exists(
             os.path.join(main.UP_DIR, f"{out['doc_id']}.prims.json")))
+
+
+class PlanPdfUploadTest(_TempDataDirs):
+    """/plan-pdf: the finished-floor-plan-PDF intake, mirroring /parse's
+    upload guards but caching a cropped image instead of geometry."""
+
+    def _post(self, raw, filename):
+        uf = UploadFile(file=io.BytesIO(raw), filename=filename)
+        return asyncio.run(upload_plan_pdf(file=uf))
+
+    def test_happy_path_caches_planimg_and_returns_dims(self):
+        out = self._post(fx.pdf_bytes(size=(400, 300)), "plan.pdf")
+        self.assertIsNotNone(out["width"])
+        self.assertIsNotNone(out["height"])
+        self.assertTrue(os.path.exists(
+            os.path.join(main.UP_DIR, f"{out['doc_id']}.planimg.png")))
+
+    def test_multi_page_pdf_rejected_422(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._post(fx.pdf_bytes(pages=2), "plan.pdf")
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_garbage_content_behind_pdf_extension_is_422(self):
+        """Extension-trust matches /parse's convention: a correct extension
+        with unreadable content fails inside the parser (422), not at the
+        extension gate (415)."""
+        with self.assertRaises(HTTPException) as ctx:
+            self._post(b"not a pdf", "plan.pdf")
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_wrong_extension_rejected_415(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._post(fx.pdf_bytes(), "plan.dxf")
+        self.assertEqual(ctx.exception.status_code, 415)
 
 
 if __name__ == "__main__":
