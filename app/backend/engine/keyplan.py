@@ -26,6 +26,50 @@ PLAN_MAX_W, PLAN_MAX_H = 800, 640
 DEFAULT_SERIF = "Georgia, 'Times New Roman', serif"
 DEFAULT_SANS = "'Helvetica Neue', Helvetica, Arial, sans-serif"
 
+_PDF_PLAN_MAX_DIM = 2200   # longest edge, in px, for a print-quality plan rasterization
+
+
+class PdfPlanError(ValueError):
+    """Raised when a PDF can't be turned into a floor-plan image."""
+
+
+def pdf_to_png(raw_bytes, target_max_dim=_PDF_PLAN_MAX_DIM):
+    """Rasterize a single-page PDF's page to a print-quality PNG.
+
+    Print quality needs a much larger raster than brand.py's _pdf_first_page
+    (which only samples colors from a thumbnail), so this uses its own zoom
+    tuned to target_max_dim instead of sharing that function. Rejects
+    multi-page PDFs rather than silently guessing page 1 — a submittal PDF
+    with a cover page first would otherwise crop the wrong page with no error.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError as exc:
+        raise PdfPlanError(
+            "PDF support needs PyMuPDF (pip install PyMuPDF).") from exc
+    try:
+        doc = fitz.open(stream=raw_bytes, filetype="pdf")
+    except Exception as exc:
+        raise PdfPlanError("Couldn't open that PDF.") from exc
+    try:
+        if doc.page_count < 1:
+            raise PdfPlanError("That PDF has no pages.")
+        if doc.page_count > 1:
+            raise PdfPlanError(
+                "That PDF has more than one page. Export or save just the "
+                "floor-plan page, then re-upload.")
+        page = doc.load_page(0)
+        longest = max(page.rect.width, page.rect.height)
+        if longest <= 0:
+            raise PdfPlanError("That PDF page has no visible content.")
+        zoom = target_max_dim / longest
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        buf = io.BytesIO()
+        Image.frombytes("RGB", (pix.width, pix.height), pix.samples).save(buf, "PNG")
+        return buf.getvalue()
+    finally:
+        doc.close()
+
 
 def _font_stack(value, generic):
     """Quote a bare brand family name into a valid CSS stack (see the twin in

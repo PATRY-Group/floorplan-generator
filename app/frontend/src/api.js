@@ -46,6 +46,16 @@ export async function renderSheet(payload, signal) {
   return handle(r, "Render failed");
 }
 
+// A PDF of an already-finished floor plan (no vector geometry) — rasterized,
+// autocropped, and cached server-side the same way parseFile() caches DXF
+// geometry, so the returned doc_id works with renderSheet() unchanged.
+export async function parsePlanPdf(file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  const r = await fetch(BASE + "/plan-pdf", { method: "POST", body: fd });
+  return handle(r, "PDF parse failed");
+}
+
 export async function uploadPlate(file) {
   const fd = new FormData();
   fd.append("file", file);

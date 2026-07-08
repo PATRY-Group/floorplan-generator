@@ -279,6 +279,168 @@ def _role_lookup(layer_map):
     return out
 
 
+def _brand_chrome(config, palette, DARK, ACCENT, MID, LIGHT, SERIF, SERIF_NAME, SANS,
+                  plan_top, plan_h):
+    """Everything in the branded header/footer band that depends only on
+    metadata/palette/fonts, not on the plan's own geometry (walls vs. a raster
+    image) beyond the plan's centered box (plan_top/plan_h). Shared by render()
+    (vector plan) and render_image_plan() (raster plan) so the two never drift —
+    unlike keyplan.py's render_keyplan_sheet, which duplicates a much smaller,
+    static frame for a different, standalone-page use case."""
+    esc = html.escape
+    md = config.get("metadata") or {}          # unit metadata (title/suite/…)
+    title = esc((md.get("title") or "").upper())
+    suite = esc(md.get("suite") or "")
+    sf = esc(md.get("sf") or "")
+    prop_name = esc((md.get("property_name") or "").upper())
+    location = esc((md.get("location") or "").upper())
+    lockup = esc(md.get("lockup") or "")
+    watermark = esc(md.get("watermark") or lockup or "")
+    # Centered ghost watermark behind the plan: an uploaded image if provided,
+    # otherwise the text mark sized to fit the page width (so a longer mark like
+    # "2274" scales down instead of overflowing the fixed 430px size).
+    # The ghost mark is composited LAST, over the plan and any manual paint, so
+    # the brand stays visible on top of painted-over quirks (it's faint, ~7%, so
+    # over an opaque blob it reads as a subtle tint). For the interactive editor
+    # the watermark is omitted from the SVG (config["live_preview"]) and returned
+    # in meta so the frontend can lay it above the paint <canvas>; baked exports
+    # keep it inline. Both routes use this exact markup, so preview == export.
+    wm_img = _safe_data_uri(md.get("watermark_image"))
+    wm_cx, wm_cy = PAGE_W / 2, plan_top + plan_h / 2
+    if md.get("hide_watermark"):
+        # Per-sheet toggle (carried in unit metadata): suppress the ghost mark so
+        # manual paint doesn't clash with it. Persists on save, restores on re-open.
+        watermark_svg = ""
+    elif wm_img:
+        wm_box = 460.0
+        watermark_svg = (
+            f'<image href="{wm_img}" x="{wm_cx - wm_box / 2:.0f}" '
+            f'y="{wm_cy - wm_box / 2:.0f}" width="{wm_box:.0f}" height="{wm_box:.0f}" '
+            f'opacity="0.08" preserveAspectRatio="xMidYMid meet"/>')
+    elif watermark:
+        wm_size = min(430.0, 1500.0 / max(len(watermark), 1))
+        watermark_svg = (
+            f'<text x="{wm_cx:.0f}" y="{wm_cy:.0f}" text-anchor="middle" '
+            f'dominant-baseline="central" font-family="{SERIF}" font-weight="bold" '
+            f'font-size="{wm_size:.0f}" fill="{ACCENT}" fill-opacity="0.07">{watermark}</text>')
+    else:
+        watermark_svg = ""
+    # Optional "SOLD OUT" status stamp: a bold centered diagonal mark laid *on
+    # top of everything*, including the paint layer and the ghost watermark.
+    # Per-sheet flag carried in the unit
+    # metadata, so it persists on save, restores on re-open, and rides into the
+    # PNG export. The bare plan_only export never reaches here, so it stays clean.
+    sold_out_svg = ""
+    if md.get("sold_out"):
+        so_text = "SOLD OUT"
+        so_target_w = PAGE_W * 0.74          # how wide the mark should run
+        so_size, so_ls = 150.0, 8.0
+        tw = _text_w(so_text, so_size, so_ls)
+        if tw > so_target_w:                 # shrink to fit, keeping proportions
+            scale = so_target_w / tw
+            so_size, so_ls, tw = so_size * scale, so_ls * scale, so_target_w
+        pad_x, pad_y = so_size * 0.34, so_size * 0.30
+        box_w, box_h = tw + pad_x * 2, so_size + pad_y * 2
+        bx, by = wm_cx - box_w / 2, wm_cy - box_h / 2
+        SOLD = "#C0392B"
+        sold_out_svg = (
+            f'<g transform="rotate(-18 {wm_cx:.0f} {wm_cy:.0f})" opacity="0.62">'
+            f'<rect x="{bx:.0f}" y="{by:.0f}" width="{box_w:.0f}" height="{box_h:.0f}" '
+            f'rx="{so_size * 0.12:.0f}" fill="none" stroke="{SOLD}" '
+            f'stroke-width="{max(6.0, so_size * 0.06):.0f}"/>'
+            f'<text x="{wm_cx:.0f}" y="{wm_cy:.0f}" text-anchor="middle" '
+            f'dominant-baseline="central" font-family="{SANS}" font-weight="bold" '
+            f'font-size="{so_size:.0f}" letter-spacing="{so_ls:.1f}" fill="{SOLD}">'
+            f'{so_text}</text></g>')
+    footer_addr = esc((md.get("footer_address") or "").upper())
+    header_right = esc((md.get("header_right") or "FLOOR PLAN").upper())
+    disclaimer = esc(md.get("disclaimer") or
+                     "FOR ILLUSTRATIVE PURPOSES ONLY. DIMENSIONS ARE "
+                     "APPROXIMATE AND SUBJECT TO CHANGE.")
+    sub_line = suite
+    if suite and sf:
+        sub_line = f"{suite}&#160;&#160;&#183;&#160;&#160;{sf}"
+    elif sf:
+        sub_line = sf
+    lockup_x = 60
+    lockup_svg = ""
+    # The uploaded watermark logo can optionally double as the header mark too
+    # (property-level "logo_in_header" brand choice) — same image, two spots,
+    # so a property with a logo doesn't need a second header-only asset.
+    if md.get("logo_in_header") and wm_img:
+        try:
+            _, b64 = wm_img.split(",", 1)
+            iw, ih = img_size(base64.b64decode(b64))
+            logo_h = min(52.0, HEADER_H - 24.0)
+            lockup_w = (iw / ih * logo_h) if ih else logo_h
+            logo_y = (HEADER_H - logo_h) / 2
+            lockup_svg = (f'<image href="{wm_img}" x="{lockup_x}" y="{logo_y:.1f}" '
+                          f'width="{lockup_w:.1f}" height="{logo_h:.1f}" '
+                          f'preserveAspectRatio="xMidYMid meet"/>')
+        except Exception:
+            lockup_svg = ""
+    if not lockup_svg:
+        # Measure the lockup in its actual font when we have the file, so the
+        # divider/name spacing adapts to the font instead of a fixed-width guess.
+        _disp = next((f for f in (config.get("font_faces") or [])
+                      if f.get("data") and (f.get("role") == "serif" or f.get("family") == SERIF_NAME)), None)
+        if _disp:
+            try:
+                lockup_w = _glyph_width(_disp["data"], lockup, 44, 0)
+            except Exception:
+                lockup_w = _text_w(lockup, 44, 0)
+        else:
+            lockup_w = _text_w(lockup, 44, 0)
+        lockup_svg = (f'<text x="{lockup_x}" y="62" font-family="{SERIF}" '
+                      f'font-weight="bold" font-size="44" fill="{ACCENT}">{lockup}</text>')
+    divider_x = lockup_x + 12 + lockup_w
+    name_x = divider_x + 20
+
+    # ---- optional footer key-plan mini-plate -------------------------------
+    keyplan = config.get("keyplan") or {}
+    footer_kp_svg = ""
+    addr_x = PAGE_W - 60
+    floor_label_svg = ""
+    if keyplan.get("plate_bytes") and keyplan.get("placement") == "footer":
+        iw, ih = img_size(keyplan["plate_bytes"])
+        # Aspect-fit the (already-cropped) image into the footer slot so a
+        # portrait plan isn't stretched into a landscape box. Center it in the
+        # band ABOVE the disclaimer line (which sits at PAGE_H-18) so the plan
+        # never crowds the "SCHEMATIC, NOT TO SCALE" caption beneath it.
+        kp_max_w, kp_max_h = 150.0, 86.0
+        sc = min(kp_max_w / max(iw, 1), kp_max_h / max(ih, 1))
+        kp_w, kp_h = iw * sc, ih * sc
+        kp_ox = PAGE_W - 60 - kp_w
+        region_top = (PAGE_H - FOOTER_H) + 12
+        region_bot = PAGE_H - 30
+        kp_oy = region_top + max(0.0, (region_bot - region_top - kp_h) / 2)
+        footer_kp_svg = keyplan_group(keyplan["plate_bytes"],
+                                      kp_ox, kp_oy, kp_w, kp_h, palette)
+        addr_x = kp_ox - 24
+        fl = esc((keyplan.get("floor_label") or "").upper())
+        kp_cx = kp_ox + kp_w / 2
+        floor_label_svg = (
+            f'<text x="{kp_cx:.0f}" y="{PAGE_H-18}" text-anchor="middle" '
+            f'font-size="7" letter-spacing="2" fill="{MID}" '
+            f'fill-opacity="0.6">{fl} &#183; SCHEMATIC, NOT TO SCALE</text>')
+
+    # In the live editor the watermark rides above the paint <canvas> as a
+    # separate overlay (see meta["watermark_svg"]); leaving it out of the SVG
+    # there avoids drawing it twice. Exports bake it inline, over the paint.
+    wm_in_doc = "" if config.get("live_preview") else watermark_svg
+
+    return {
+        "title": title, "sub_line": sub_line,
+        "prop_name": prop_name, "location": location,
+        "lockup_svg": lockup_svg, "header_right": header_right,
+        "footer_addr": footer_addr, "disclaimer": disclaimer,
+        "divider_x": divider_x, "name_x": name_x,
+        "footer_kp_svg": footer_kp_svg, "floor_label_svg": floor_label_svg,
+        "addr_x": addr_x, "sold_out_svg": sold_out_svg,
+        "watermark_svg": watermark_svg, "wm_in_doc": wm_in_doc,
+    }
+
+
 def render(prims, config):
     palette = {**DEFAULT_PALETTE, **(config.get("palette") or {})}
     # Palette colours are user-supplied (property setup / render override) and
@@ -303,7 +465,6 @@ def render(prims, config):
     drop = set(layer_map.get("drop", []))
     floor_hatch = set(layer_map.get("floor_hatch", []))
     wall_fill_layers = set(layer_map.get("wall_fill", []))
-    md = config.get("metadata") or {}          # unit metadata (title/suite/…)
     rooms = config.get("rooms") or []
 
     wall_roles = {"wall_line", "wall_fill"}
@@ -556,131 +717,20 @@ def render(prims, config):
         }
         return bare, png_bytes, meta
 
-    title = esc((md.get("title") or "").upper())
-    suite = esc(md.get("suite") or "")
-    sf = esc(md.get("sf") or "")
-    prop_name = esc((md.get("property_name") or "").upper())
-    location = esc((md.get("location") or "").upper())
-    lockup = esc(md.get("lockup") or "")
-    watermark = esc(md.get("watermark") or lockup or "")
-    # Centered ghost watermark behind the plan: an uploaded image if provided,
-    # otherwise the text mark sized to fit the page width (so a longer mark like
-    # "2274" scales down instead of overflowing the fixed 430px size).
-    # The ghost mark is composited LAST, over the plan and any manual paint, so
-    # the brand stays visible on top of painted-over quirks (it's faint, ~7%, so
-    # over an opaque blob it reads as a subtle tint). For the interactive editor
-    # the watermark is omitted from the SVG (config["live_preview"]) and returned
-    # in meta so the frontend can lay it above the paint <canvas>; baked exports
-    # keep it inline. Both routes use this exact markup, so preview == export.
-    wm_img = _safe_data_uri(md.get("watermark_image"))
-    wm_cx, wm_cy = PAGE_W / 2, plan_top + plan_h / 2
-    if md.get("hide_watermark"):
-        # Per-sheet toggle (carried in unit metadata): suppress the ghost mark so
-        # manual paint doesn't clash with it. Persists on save, restores on re-open.
-        watermark_svg = ""
-    elif wm_img:
-        wm_box = 460.0
-        watermark_svg = (
-            f'<image href="{wm_img}" x="{wm_cx - wm_box / 2:.0f}" '
-            f'y="{wm_cy - wm_box / 2:.0f}" width="{wm_box:.0f}" height="{wm_box:.0f}" '
-            f'opacity="0.08" preserveAspectRatio="xMidYMid meet"/>')
-    elif watermark:
-        wm_size = min(430.0, 1500.0 / max(len(watermark), 1))
-        watermark_svg = (
-            f'<text x="{wm_cx:.0f}" y="{wm_cy:.0f}" text-anchor="middle" '
-            f'dominant-baseline="central" font-family="{SERIF}" font-weight="bold" '
-            f'font-size="{wm_size:.0f}" fill="{ACCENT}" fill-opacity="0.07">{watermark}</text>')
-    else:
-        watermark_svg = ""
-    # Optional "SOLD OUT" status stamp: a bold centered diagonal mark laid *on
-    # top of everything*, including the paint layer and the ghost watermark.
-    # Per-sheet flag carried in the unit
-    # metadata, so it persists on save, restores on re-open, and rides into the
-    # PNG export. The bare plan_only export never reaches here, so it stays clean.
-    sold_out_svg = ""
-    if md.get("sold_out"):
-        so_text = "SOLD OUT"
-        so_target_w = PAGE_W * 0.74          # how wide the mark should run
-        so_size, so_ls = 150.0, 8.0
-        tw = _text_w(so_text, so_size, so_ls)
-        if tw > so_target_w:                 # shrink to fit, keeping proportions
-            scale = so_target_w / tw
-            so_size, so_ls, tw = so_size * scale, so_ls * scale, so_target_w
-        pad_x, pad_y = so_size * 0.34, so_size * 0.30
-        box_w, box_h = tw + pad_x * 2, so_size + pad_y * 2
-        bx, by = wm_cx - box_w / 2, wm_cy - box_h / 2
-        SOLD = "#C0392B"
-        sold_out_svg = (
-            f'<g transform="rotate(-18 {wm_cx:.0f} {wm_cy:.0f})" opacity="0.62">'
-            f'<rect x="{bx:.0f}" y="{by:.0f}" width="{box_w:.0f}" height="{box_h:.0f}" '
-            f'rx="{so_size * 0.12:.0f}" fill="none" stroke="{SOLD}" '
-            f'stroke-width="{max(6.0, so_size * 0.06):.0f}"/>'
-            f'<text x="{wm_cx:.0f}" y="{wm_cy:.0f}" text-anchor="middle" '
-            f'dominant-baseline="central" font-family="{SANS}" font-weight="bold" '
-            f'font-size="{so_size:.0f}" letter-spacing="{so_ls:.1f}" fill="{SOLD}">'
-            f'{so_text}</text></g>')
-    footer_addr = esc((md.get("footer_address") or "").upper())
-    header_right = esc((md.get("header_right") or "FLOOR PLAN").upper())
-    disclaimer = esc(md.get("disclaimer") or
-                     "FOR ILLUSTRATIVE PURPOSES ONLY. DIMENSIONS ARE "
-                     "APPROXIMATE AND SUBJECT TO CHANGE.")
-    sub_line = suite
-    if suite and sf:
-        sub_line = f"{suite}&#160;&#160;&#183;&#160;&#160;{sf}"
-    elif sf:
-        sub_line = sf
-    lockup_x = 60
-    # Measure the lockup in its actual font when we have the file, so the
-    # divider/name spacing adapts to the font instead of a fixed-width guess.
-    _disp = next((f for f in (config.get("font_faces") or [])
-                  if f.get("data") and (f.get("role") == "serif" or f.get("family") == SERIF_NAME)), None)
-    if _disp:
-        try:
-            lockup_w = _glyph_width(_disp["data"], lockup, 44, 0)
-        except Exception:
-            lockup_w = _text_w(lockup, 44, 0)
-    else:
-        lockup_w = _text_w(lockup, 44, 0)
-    divider_x = lockup_x + 12 + lockup_w
-    name_x = divider_x + 20
-
-    # ---- optional footer key-plan mini-plate -------------------------------
-    keyplan = config.get("keyplan") or {}
-    footer_kp_svg = ""
-    addr_x = PAGE_W - 60
-    floor_label_svg = ""
-    if keyplan.get("plate_bytes") and keyplan.get("placement") == "footer":
-        iw, ih = img_size(keyplan["plate_bytes"])
-        # Aspect-fit the (already-cropped) image into the footer slot so a
-        # portrait plan isn't stretched into a landscape box. Center it in the
-        # band ABOVE the disclaimer line (which sits at PAGE_H-18) so the plan
-        # never crowds the "SCHEMATIC, NOT TO SCALE" caption beneath it.
-        kp_max_w, kp_max_h = 150.0, 86.0
-        sc = min(kp_max_w / max(iw, 1), kp_max_h / max(ih, 1))
-        kp_w, kp_h = iw * sc, ih * sc
-        kp_ox = PAGE_W - 60 - kp_w
-        region_top = (PAGE_H - FOOTER_H) + 12
-        region_bot = PAGE_H - 30
-        kp_oy = region_top + max(0.0, (region_bot - region_top - kp_h) / 2)
-        footer_kp_svg = keyplan_group(keyplan["plate_bytes"],
-                                      kp_ox, kp_oy, kp_w, kp_h, palette)
-        addr_x = kp_ox - 24
-        fl = esc((keyplan.get("floor_label") or "").upper())
-        kp_cx = kp_ox + kp_w / 2
-        floor_label_svg = (
-            f'<text x="{kp_cx:.0f}" y="{PAGE_H-18}" text-anchor="middle" '
-            f'font-size="7" letter-spacing="2" fill="{MID}" '
-            f'fill-opacity="0.6">{fl} &#183; SCHEMATIC, NOT TO SCALE</text>')
-
-    # In the live editor the watermark rides above the paint <canvas> as a
-    # separate overlay (see meta["watermark_svg"]); leaving it out of the SVG
-    # there avoids drawing it twice. Exports bake it inline, over the paint.
-    wm_in_doc = "" if config.get("live_preview") else watermark_svg
+    ch = _brand_chrome(config, palette, DARK, ACCENT, MID, LIGHT, SERIF, SERIF_NAME, SANS,
+                       plan_top, plan_h)
+    title, sub_line = ch["title"], ch["sub_line"]
+    prop_name, location = ch["prop_name"], ch["location"]
+    lockup_svg, header_right = ch["lockup_svg"], ch["header_right"]
+    footer_addr, disclaimer = ch["footer_addr"], ch["disclaimer"]
+    divider_x, name_x = ch["divider_x"], ch["name_x"]
+    footer_kp_svg, floor_label_svg, addr_x = ch["footer_kp_svg"], ch["floor_label_svg"], ch["addr_x"]
+    sold_out_svg, watermark_svg, wm_in_doc = ch["sold_out_svg"], ch["watermark_svg"], ch["wm_in_doc"]
 
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {PAGE_W} {PAGE_H}" font-family="{SANS}">
   <rect width="{PAGE_W}" height="{PAGE_H}" fill="{LIGHT}"/>
   <rect width="{PAGE_W}" height="{HEADER_H}" fill="{DARK}"/>
-  <text x="{lockup_x}" y="62" font-family="{SERIF}" font-weight="bold" font-size="44" fill="{ACCENT}">{lockup}</text>
+  {lockup_svg}
   <line x1="{divider_x:.0f}" y1="24" x2="{divider_x:.0f}" y2="68" stroke="{ACCENT}" stroke-width="1.2" stroke-opacity="0.7"/>
   <text x="{name_x:.0f}" y="50" font-size="21" letter-spacing="7" fill="#FFFFFF">{prop_name}</text>
   <text x="{name_x:.0f}" y="71" font-size="11" letter-spacing="4" fill="{MID}" fill-opacity="0.85">{location}</text>
@@ -718,6 +768,93 @@ def render(prims, config):
         "placements": placements,
         # Ghost watermark markup, so the editor can lay it above the paint canvas
         # (live_preview omits it from the SVG above to avoid a double draw).
+        "watermark_svg": watermark_svg,
+    }
+    return svg, png_bytes, meta
+
+
+def render_image_plan(image_bytes, config):
+    """Branded sheet for an already-finished raster floor plan (e.g. rasterized
+    from a single-page PDF) instead of vector-drawn DXF geometry — no walls, no
+    room labels, nothing to drag. Wraps the exact same header/footer/lockup/
+    watermark frame as render() (via the shared _brand_chrome()) around one
+    embedded image, aspect-fit into the same PLAN_MAX_W/PLAN_MAX_H box."""
+    palette = {**DEFAULT_PALETTE, **(config.get("palette") or {})}
+    DARK = _safe_color(palette["dark"], DEFAULT_PALETTE["dark"])
+    ACCENT = _safe_color(palette["accent"], DEFAULT_PALETTE["accent"])
+    MID = _safe_color(palette["mid"], DEFAULT_PALETTE["mid"])
+    LIGHT = _safe_color(palette["light"], DEFAULT_PALETTE["light"])
+    fonts = config.get("fonts") or {}
+    SERIF_NAME = fonts.get("serif", DEFAULT_SERIF)
+    SANS_NAME = fonts.get("sans", DEFAULT_SANS)
+    SERIF = _font_stack(SERIF_NAME, "serif")
+    SANS = _font_stack(SANS_NAME, "sans-serif")
+
+    iw, ih = img_size(image_bytes)
+    s = min(PLAN_MAX_W / max(iw, 1), PLAN_MAX_H / max(ih, 1))
+    plan_w, plan_h = iw * s, ih * s
+    plan_top = HEADER_H + (PAGE_H - HEADER_H - FOOTER_H - plan_h) / 2
+    plan_left = (PAGE_W - plan_w) / 2
+
+    _paint = _safe_data_uri(config.get("paint_image"))
+    paint_layer_svg = (
+        f'<image href="{_paint}" x="0" y="0" width="{PAGE_W}" height="{PAGE_H}" '
+        f'preserveAspectRatio="none"/>' if _paint else "")
+
+    # ---- "plan only" export: just the cropped image, no chrome -------------
+    # Mirrors render()'s plan_only contract exactly, since both the live
+    # "plan only" preview button and the saved-sheet ZIP re-render depend on it.
+    if config.get("plan_only"):
+        bare = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {iw} {ih}" '
+            f'font-family="{SANS}">\n'
+            f'<rect width="{iw}" height="{ih}" fill="#FFFFFF"/>\n'
+            f'{keyplan_group(image_bytes, 0, 0, iw, ih, palette, with_border=False)}\n'
+            f'{paint_layer_svg}\n</svg>'
+        )
+        out_w = min(2400, max(1000, iw))
+        png_bytes = render_png(bare, out_w)
+        meta = {"page": {"w": iw, "h": ih}, "plan_only": True}
+        return bare, png_bytes, meta
+
+    ch = _brand_chrome(config, palette, DARK, ACCENT, MID, LIGHT, SERIF, SERIF_NAME, SANS,
+                       plan_top, plan_h)
+    title, sub_line = ch["title"], ch["sub_line"]
+    prop_name, location = ch["prop_name"], ch["location"]
+    lockup_svg, header_right = ch["lockup_svg"], ch["header_right"]
+    footer_addr, disclaimer = ch["footer_addr"], ch["disclaimer"]
+    divider_x, name_x = ch["divider_x"], ch["name_x"]
+    footer_kp_svg, floor_label_svg, addr_x = ch["footer_kp_svg"], ch["floor_label_svg"], ch["addr_x"]
+    sold_out_svg, watermark_svg, wm_in_doc = ch["sold_out_svg"], ch["watermark_svg"], ch["wm_in_doc"]
+
+    plan_group = keyplan_group(image_bytes, plan_left, plan_top, plan_w, plan_h,
+                               palette, with_border=False)
+
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {PAGE_W} {PAGE_H}" font-family="{SANS}">
+  <rect width="{PAGE_W}" height="{PAGE_H}" fill="{LIGHT}"/>
+  <rect width="{PAGE_W}" height="{HEADER_H}" fill="{DARK}"/>
+  {lockup_svg}
+  <line x1="{divider_x:.0f}" y1="24" x2="{divider_x:.0f}" y2="68" stroke="{ACCENT}" stroke-width="1.2" stroke-opacity="0.7"/>
+  <text x="{name_x:.0f}" y="50" font-size="21" letter-spacing="7" fill="#FFFFFF">{prop_name}</text>
+  <text x="{name_x:.0f}" y="71" font-size="11" letter-spacing="4" fill="{MID}" fill-opacity="0.85">{location}</text>
+  <text x="{PAGE_W-60}" y="56" text-anchor="end" font-size="11" letter-spacing="3.5" fill="{MID}" fill-opacity="0.7">{header_right}</text>
+  {plan_group}
+  {paint_layer_svg}
+  {wm_in_doc}
+  {sold_out_svg}
+  <rect y="{PAGE_H-FOOTER_H}" width="{PAGE_W}" height="{FOOTER_H}" fill="{DARK}"/>
+  <text x="60" y="{PAGE_H-FOOTER_H+62}" font-family="{SERIF}" font-size="40" fill="#FFFFFF">{title}</text>
+  <line x1="62" y1="{PAGE_H-FOOTER_H+80}" x2="122" y2="{PAGE_H-FOOTER_H+80}" stroke="{ACCENT}" stroke-width="2.5"/>
+  <text x="60" y="{PAGE_H-FOOTER_H+106}" font-size="12.5" letter-spacing="3" fill="{MID}">{sub_line}</text>
+  <text x="{addr_x:.0f}" y="{PAGE_H-FOOTER_H+62}" text-anchor="end" font-size="12" letter-spacing="2.5" fill="{ACCENT}">{footer_addr}</text>
+  <text x="{addr_x:.0f}" y="{PAGE_H-FOOTER_H+104}" text-anchor="end" font-size="8.5" letter-spacing="1" fill="{MID}" fill-opacity="0.45">{disclaimer}</text>
+  {footer_kp_svg}
+  {floor_label_svg}
+</svg>'''
+
+    png_bytes = render_png(svg, SHEET_PNG_W)
+    meta = {
+        "page": {"w": PAGE_W, "h": PAGE_H},
         "watermark_svg": watermark_svg,
     }
     return svg, png_bytes, meta

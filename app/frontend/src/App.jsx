@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import {
-  getCapabilities, listProperties, parseFile, renderSheet,
+  getCapabilities, listProperties, parseFile, parsePlanPdf, renderSheet,
   listAllSheets, reopenSheet, deleteSheet, renameSheet,
 } from "./api.js";
 import LabelOverlay from "./LabelOverlay.jsx";
@@ -103,6 +103,7 @@ function rolesToLayerMap(roles) {
 // upload (handleFile) and batch (runBatch) paths so they can't drift.
 function parsedDocFields(d, fileName) {
   return {
+    kind: "dxf",
     fileName,
     docId: d.doc_id,
     rooms: d.labels.map((l) => ({ ...l, rid: uid() })),   // stable React key, survives reorder/delete
@@ -130,10 +131,34 @@ function parsedDocFields(d, fileName) {
   };
 }
 
+// Map a /plan-pdf response onto the doc fields it populates — an already-
+// finished floor plan has no geometry/labels to seed, just a docId to render.
+function parsedPdfDocFields(d, fileName) {
+  return {
+    kind: "image",
+    fileName,
+    docId: d.doc_id,
+    rooms: [],
+    deletedRooms: [],
+    ignored: [],
+    suggestions: {},
+    warnings: [],
+    layerInferred: false,
+    layerReport: null,
+    layerMapUsed: null,
+    layerRoles: null,
+    parseError: "",
+    svg: "",
+    savedId: null,
+    meta: { title: titleFromFileName(fileName) || "", suite: "", sf: "" },
+  };
+}
+
 // One open floor-plan editing session (one tab).
 function newDoc(propertyId) {
   return {
     id: uid(),
+    kind: "dxf",           // "dxf" (vector geometry, editable labels) | "image" (finished raster plan)
     propertyId: propertyId || "",
     fileName: "",
     docId: null,           // server geometry handle
@@ -483,9 +508,15 @@ export default function App() {
     }
     setParsing(true);
     patchDoc(id, { fileName: file.name, parseError: "", svg: "", savedId: null });
+    const isPdf = file.name.toLowerCase().endsWith(".pdf");
     try {
-      const d = await parseFile(file, prop || undefined);
-      patchDoc(id, { ...parsedDocFields(d, file.name), fileObj: file });
+      if (isPdf) {
+        const d = await parsePlanPdf(file);
+        patchDoc(id, { ...parsedPdfDocFields(d, file.name), fileObj: null });
+      } else {
+        const d = await parseFile(file, prop || undefined);
+        patchDoc(id, { ...parsedDocFields(d, file.name), fileObj: file });
+      }
       setOpenSection("details");
     } catch (e) {
       patchDoc(id, { docId: null, rooms: [], parseError: e.message });
@@ -550,8 +581,10 @@ export default function App() {
         const item = items[next++];
         setStatus(item.qid, { status: "parsing" });
         try {
-          const d = await parseFile(item.file, prop || undefined);
-          const doc = { ...newDoc(prop), ...parsedDocFields(d, item.fileName), fileObj: item.file };
+          const isPdf = item.fileName.toLowerCase().endsWith(".pdf");
+          const doc = isPdf
+            ? { ...newDoc(prop), ...parsedPdfDocFields(await parsePlanPdf(item.file), item.fileName) }
+            : { ...newDoc(prop), ...parsedDocFields(await parseFile(item.file, prop || undefined), item.fileName), fileObj: item.file };
           setDocs((ds) => [...ds, doc]);
           setStatus(item.qid, { status: "ready", docId: doc.id });
           accepted++;
@@ -836,6 +869,7 @@ export default function App() {
   function docFromReopenCfg(cfg, prop, sheetId, title) {
     const d = newDoc(cfg.property_id || prop);
     d.docId = cfg.doc_id;
+    d.kind = cfg.kind || "dxf";
     d.rooms = (cfg.rooms || []).map((r) => ({ ...r }));
     d.meta = cfg.metadata || { title: "", suite: "", sf: "" };
     d.keyplan = cfg.keyplan || null;
@@ -1119,13 +1153,14 @@ export default function App() {
               </span>
             </h3>
             <label className="drop">
-              {parsing ? "Parsing…" : (active && active.fileName ? active.fileName : "Select up to 10 DXF files")}
-              <input type="file" multiple accept=".dxf,.dwg"
+              {parsing ? "Parsing…" : (active && active.fileName ? active.fileName : "Select up to 10 DXF or PDF files")}
+              <input type="file" multiple accept=".dxf,.dwg,.pdf"
                 onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }} />
             </label>
             {caps && (
               <p className="subtle" style={{ marginTop: 6 }}>
-                Accepts {caps.formats_accepted.join(", ").toUpperCase()}.
+                Accepts {caps.formats_accepted.join(", ").toUpperCase()}, or a PDF of an
+                already-finished floor plan (single page — just adds the branding).
                 {!caps.dwg_conversion && " DWG needs the ODA converter on the server."}
                 {" "}.rvt is not supported — export a DXF view from Revit.
               </p>
@@ -1162,6 +1197,7 @@ export default function App() {
                 </div>
               </div>
 
+              {active.kind !== "image" && (
               <div className="step">
                 <div className="rooms-head">
                   <h3><span className="num">4</span> Rooms ({active.rooms.length})</h3>
@@ -1224,6 +1260,7 @@ export default function App() {
                   </div>
                 )}
               </div>
+              )}
 
               <KeyPlanPanel key={active.id}
                 initial={active.keyplan}
@@ -1434,11 +1471,13 @@ export default function App() {
                   title="Overlay a centered SOLD OUT stamp on the sheet">
                   {active.meta.sold_out ? "✓ Sold out" : "Sold out"}
                 </button>
+                {active.kind !== "image" && (
                 <button className={"btn ghost" + (active.meta.wall_style !== "solid" ? " active" : "")}
                   onClick={() => patchActive((d) => ({ meta: { ...d.meta, wall_style: d.meta.wall_style === "solid" ? "skinny" : "solid" } }))}
                   title="Skinny outline walls (default) vs solid poché fill">
                   {active.meta.wall_style !== "solid" ? "✓ Skinny walls" : "Skinny walls"}
                 </button>
+                )}
                 <button className={"btn ghost" + (active.meta.hide_watermark ? " active" : "")}
                   onClick={() => patchActive((d) => ({ meta: { ...d.meta, hide_watermark: !d.meta.hide_watermark } }))}
                   title="Hide the ghost watermark (e.g. while painting) — affects preview and export">

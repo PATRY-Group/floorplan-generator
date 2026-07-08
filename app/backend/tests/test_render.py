@@ -6,6 +6,7 @@ PNG, the coordinate transform that the drag-to-fix overlay depends on, label
 placement (override vs auto-search), palette application, watermark behaviour,
 XML escaping, and the bare 'plan_only' export path.
 """
+import base64
 import io
 import os
 import re
@@ -16,7 +17,7 @@ import numpy as np
 from PIL import Image
 
 import fixtures as fx
-from engine import render, DEFAULT_LAYER_MAP
+from engine import render, render_image_plan, DEFAULT_LAYER_MAP
 from engine.render import PAGE_W, PAGE_H, DEFAULT_PALETTE
 from engine.keyplan_trace import solidify_walls
 
@@ -193,6 +194,51 @@ class WatermarkTest(unittest.TestCase):
         self.assertNotIn(img_uri, image)                 # no image mark either
 
 
+class LogoInHeaderTest(unittest.TestCase):
+    """The uploaded watermark logo can optionally double as the header mark
+    (property-level 'logo_in_header' brand choice) — same image, two spots."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.prims = parse_unit_prims()
+        buf = io.BytesIO()
+        Image.new("RGB", (120, 60), (200, 50, 50)).save(buf, "PNG")
+        cls.logo_uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    def test_default_is_text_lockup(self):
+        svg, _, _ = render(self.prims, fx.base_render_config(
+            metadata={"title": "T", "lockup": "300", "watermark_image": self.logo_uri}))
+        self.assertIn(">300<", svg)
+
+    def test_flag_swaps_header_text_for_the_logo_image(self):
+        on, _, _ = render(self.prims, fx.base_render_config(
+            metadata={"title": "T", "lockup": "300", "watermark_image": self.logo_uri,
+                      "logo_in_header": True}))
+        off, _, _ = render(self.prims, fx.base_render_config(
+            metadata={"title": "T", "lockup": "300", "watermark_image": self.logo_uri,
+                      "logo_in_header": False}))
+        self.assertNotIn(">300<", on)          # text lockup replaced
+        self.assertIn(">300<", off)            # default path unaffected
+        # same uploaded image used in both the header and the ghost watermark
+        self.assertEqual(on.count(self.logo_uri), 2)
+        ET.fromstring(on)                      # still well-formed
+
+    def test_flag_without_an_image_falls_back_to_text(self):
+        """No watermark_image uploaded -> the flag is a no-op, not a crash."""
+        svg, _, _ = render(self.prims, fx.base_render_config(
+            metadata={"title": "T", "lockup": "300", "logo_in_header": True}))
+        self.assertIn(">300<", svg)
+
+    def test_shared_with_render_image_plan(self):
+        """render_image_plan() uses the same _brand_chrome() helper, so an
+        image-sourced sheet gets identical header-logo behaviour."""
+        svg, _, _ = render_image_plan(fx.plate_png(), fx.base_render_config(
+            metadata={"title": "T", "lockup": "300", "watermark_image": self.logo_uri,
+                      "logo_in_header": True}))
+        self.assertNotIn(">300<", svg)
+        self.assertEqual(svg.count(self.logo_uri), 2)
+
+
 class PaintLayerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -234,6 +280,67 @@ class PlanOnlyTest(unittest.TestCase):
         # no header/footer band text, but the room label survives
         self.assertNotIn("FOR ILLUSTRATIVE PURPOSES ONLY", svg)
         self.assertIn("BEDROOM", svg)
+
+
+class RenderImagePlanTest(unittest.TestCase):
+    """render_image_plan wraps an already-finished raster plan (e.g. a
+    rasterized PDF page) in the same branded header/footer frame as render(),
+    via the shared _brand_chrome() — no walls, no room labels, one embedded
+    image instead."""
+
+    def test_full_sheet_has_chrome_and_embedded_image(self):
+        svg, png, meta = render_image_plan(fx.plate_png(), fx.base_render_config())
+        root = ET.fromstring(svg)                     # well-formed
+        self.assertEqual(root.get("viewBox"), f"0 0 {PAGE_W} {PAGE_H}")
+        self.assertEqual(meta["page"], {"w": PAGE_W, "h": PAGE_H})
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertIn("<image", svg)
+        self.assertIn("data:image/png;base64,", svg)
+        self.assertIn("2 BED", svg)                    # footer title from base_render_config
+        self.assertIn("FOR ILLUSTRATIVE PURPOSES ONLY", svg)
+        # the embedded plan area carries no border rect (unlike the footer mini-plate)
+        self.assertNotIn('stroke-width="1.1"', svg)
+
+    def test_plan_only_export_is_bare_image_no_chrome(self):
+        cfg = fx.base_render_config(plan_only=True)
+        svg, png, meta = render_image_plan(fx.plate_png(size=(200, 150)), cfg)
+        ET.fromstring(svg)
+        self.assertTrue(meta.get("plan_only"))
+        self.assertEqual(meta["page"], {"w": 200, "h": 150})
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertNotIn("FOR ILLUSTRATIVE PURPOSES ONLY", svg)
+        self.assertNotIn("2 BED", svg)
+
+    def test_watermark_and_sold_out_shared_with_render(self):
+        """The chrome helper is shared with render(), so brand behaviour
+        (watermark, sold-out stamp) is identical for an image-sourced plan."""
+        svg, _, _ = render_image_plan(fx.plate_png(), fx.base_render_config(
+            metadata={"title": "T", "watermark": "800", "sold_out": True}))
+        self.assertIn("SOLD OUT", svg)
+        self.assertIn('fill-opacity="0.07"', svg)      # text watermark mark
+
+    def test_paint_layer_is_embedded(self):
+        uri = "data:image/png;base64,PAINT"
+        svg, _, _ = render_image_plan(fx.plate_png(),
+                                      fx.base_render_config(paint_image=uri))
+        self.assertIn(uri, svg)
+
+    def test_aspect_fit_matches_render_scale_formula(self):
+        """A portrait image and a landscape image both land within the same
+        PLAN_MAX_W/PLAN_MAX_H box render() uses — this is what keeps an
+        image-sourced sheet visually consistent with a DXF-sourced one."""
+        from engine.render import PLAN_MAX_W, PLAN_MAX_H
+        wide_svg, _, _ = render_image_plan(fx.plate_png(size=(800, 100)),
+                                           fx.base_render_config())
+        tall_svg, _, _ = render_image_plan(fx.plate_png(size=(100, 800)),
+                                           fx.base_render_config())
+        for svg in (wide_svg, tall_svg):
+            m = re.search(r'<image href="data:image/png[^"]+" x="([\d.]+)" '
+                          r'y="([\d.]+)" width="([\d.]+)" height="([\d.]+)"', svg)
+            self.assertIsNotNone(m)
+            w, h = float(m.group(3)), float(m.group(4))
+            self.assertLessEqual(round(w), PLAN_MAX_W)
+            self.assertLessEqual(round(h), PLAN_MAX_H)
 
 
 class SolidifyWallsTest(unittest.TestCase):
