@@ -252,7 +252,9 @@ def solidify_walls(mask, close_k, open_k=3, speckle=30, smooth=0.9):
 
 def _hex(s):
     s = s.lstrip("#")
-    return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+    if len(s) in (3, 4):                       # CSS shorthand: double each nibble
+        s = "".join(c * 2 for c in s)          # #0a8 -> #00aa88 (not zero-padded)
+    return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))   # (0,2,4) drops any alpha
 
 
 def colorize(mask_png_bytes, palette):

@@ -55,9 +55,9 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-`cairosvg` needs the Cairo native library. macOS: `brew install cairo`.
-Debian/Ubuntu: `sudo apt-get install libcairo2`. Windows: it ships with the
-`cairosvg` wheel, or install the GTK3 runtime if you hit a DLL error.
+PNG output goes through `resvg-py`, a self-contained wheel — there is **no**
+system Cairo/GTK dependency to install (the old `cairosvg`/libcairo path was
+removed). DWG input is optional and needs the ODA File Converter (see below).
 
 ### 2. Frontend (port 5173)
 
@@ -89,12 +89,14 @@ Open http://localhost:5173. The dev server proxies `/api/*` to the backend on
    arrow keys** (Shift = 10px) for fine placement. Double-click a handle to
    clear the override and return it to automatic placement. Moved labels show an
    ember handle; auto-placed ones show a hollow handle.
-7. *(Optional)* **Add a key plan**: enable the Key plan section, then upload (or
-   paste) a **finished key-plan image** — one you've already exported with this
-   unit marked on it. The app trims the surrounding whitespace and embeds it as
-   reference (no in-app box-drawing or tracing). Set a floor label and choose
-   **footer mini-plate** (embedded on the unit sheet) or **standalone sheet**
-   (its own branded page). It is always marked SCHEMATIC / NOT TO SCALE.
+7. *(Optional)* **Add a key plan**: enable the Key plan section, then either
+   **upload/paste a finished key-plan image** (one you've already exported with
+   the unit marked on it — embedded as-is), or use **highlight mode**: drop a
+   plain floor-plate image and drag a box over your unit, which the app shades in
+   the brand accent. You can also rotate the plate (0/90/180/270°). Set a floor
+   label and choose **footer mini-plate** (embedded on the unit sheet) or
+   **standalone sheet** (its own branded page). It is always marked SCHEMATIC /
+   NOT TO SCALE.
 8. **Save to library & export** to write the SVG + PNG into the property’s
    library and get download links.
 9. The **library** (bottom of the page) lists every saved sheet for the
@@ -150,8 +152,8 @@ These are working files, not deliverables — finished sheets (with their own
 config + geometry copy, so they can be re-opened) live in `backend/data/sheets/`.
 
 The uploads cache is **swept automatically**: on server startup and at the start
-of every `/parse` and `/plate`, files older than `UPLOAD_TTL_HOURS` (default 24)
-are deleted. Re-opening a saved sheet re-registers its geometry with a fresh
-timestamp, so the 24h window doesn't break editing. Tune the window via the
+of every `/parse` and `/plate`, files older than `UPLOAD_TTL_HOURS` (default 168,
+i.e. one week) are deleted. Re-opening a saved sheet re-registers its geometry
+with a fresh timestamp, so the window doesn't break editing. Tune it via the
 `UPLOAD_TTL_HOURS` constant in `main.py`.
 ```

@@ -97,6 +97,17 @@ class SweepTest(_TempDataDirs):
         self.assertFalse(os.path.exists(old))
         self.assertTrue(os.path.exists(fresh))
 
+    def test_storage_listing_error_does_not_propagate(self):
+        """The sweep runs at the head of /parse and /plate, so a storage listing
+        failure (in Blob mode the SDK raises its own error, not OSError) must be
+        swallowed — it should skip the sweep, never 500 the upload."""
+        orig = main.storage.glob
+        main.storage.glob = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("blob down"))
+        try:
+            self.assertEqual(sweep_uploads(), 0)
+        finally:
+            main.storage.glob = orig
+
 
 class ComposeConfigTest(unittest.TestCase):
     def test_property_defaults_and_none_skip_and_default_layer_map(self):
@@ -449,6 +460,22 @@ class UploadGuardTest(_TempDataDirs):
         self.assertGreater(out["prim_count"], 0)
         self.assertTrue(os.path.exists(
             os.path.join(main.UP_DIR, f"{out['doc_id']}.prims.json")))
+
+    def test_local_source_upload_is_cleaned_up(self):
+        """Only prims.json should persist. The raw local upload (needed only
+        during the request) must be removed — in Blob mode the sweep never sees
+        local /tmp files, so a leftover would accumulate until the disk fills."""
+        out = self._post(fx.unit_dxf_bytes(), "unit.dxf")
+        leftovers = [f for f in os.listdir(main.UP_DIR)
+                     if f.startswith(f"{out['doc_id']}_")]
+        self.assertEqual(leftovers, [])
+
+    def test_hostile_filename_does_not_500(self):
+        """A filename with characters invalid on the host FS (e.g. ':' on
+        Windows) must not crash open() with an unhandled error (a 500) — the
+        name is sanitized before it becomes a temp path."""
+        out = self._post(fx.unit_dxf_bytes(), 'a:b*c?"<>|.dxf')
+        self.assertGreater(out["prim_count"], 0)
 
 
 class PlanPdfUploadTest(_TempDataDirs):

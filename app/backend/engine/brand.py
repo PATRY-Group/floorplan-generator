@@ -133,6 +133,13 @@ def _clean_font_name(base: str) -> str:
 # --------------------------------------------------------------------------- #
 def _dominant_colors(img: Image.Image) -> list[dict]:
     """Median-cut quantize to a handful of dominant colors with frequencies."""
+    if img.mode not in ("RGB", "L"):
+        # A transparent-background logo must composite onto white, not PIL's
+        # default black — otherwise the empty background reads as black-dominant
+        # and mis-picks dark/light.
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(bg, rgba)
     img = img.convert("RGB")
     img.thumbnail((_MAX_DIM, _MAX_DIM))
     quant = img.quantize(colors=_QUANT_COLORS, method=Image.Quantize.MEDIANCUT)

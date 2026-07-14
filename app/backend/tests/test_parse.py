@@ -12,7 +12,8 @@ import unittest
 import fixtures as fx
 from engine import parse_dxf, ParseError
 from engine.parse import (_estimate_dims, _cap_points, _clean_text,
-                          _looks_like_room, _area_to_sf, MAX_PTS_PER_ENTITY)
+                          _looks_like_room, _area_to_sf, _is_furniture,
+                          MAX_PTS_PER_ENTITY)
 
 
 class ParseGeometryTest(unittest.TestCase):
@@ -155,6 +156,22 @@ class ParseRejectionTest(unittest.TestCase):
     def test_unreadable_file_rejected(self):
         with self.assertRaises(ParseError):
             parse_dxf(os.path.join(os.path.dirname(__file__), "does-not-exist.dxf"))
+
+
+class FurnitureMatchTest(unittest.TestCase):
+    """The furniture filter must match FURNITURE_FRAGMENTS as delimited tokens,
+    not raw substrings — or a block-wrapped unit named '2BED-A_UNIT' (or a
+    'BEDROOM' block) gets its whole subtree dropped, losing walls or triggering a
+    spurious 'no wall geometry' ParseError."""
+
+    def test_loose_furniture_is_matched(self):
+        for name in ("SOFA", "BED", "BED-01", "M_SOFA", "TV-STAND",
+                     "SOFA2", "CABINET-LOOSE", "DINING-TABLE"):
+            self.assertTrue(_is_furniture(name), name)
+
+    def test_unit_and_room_blocks_are_kept(self):
+        for name in ("2BED-A_UNIT", "BEDROOM_2", "BEDROOM", "3BED", "TABLETOP-ROOM"):
+            self.assertFalse(_is_furniture(name), name)
 
 
 class TextClassificationTest(unittest.TestCase):

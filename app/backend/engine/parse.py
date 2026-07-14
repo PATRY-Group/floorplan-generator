@@ -12,7 +12,8 @@ The renderer expects the same `prims` shape the original
 `build_floorplan_sheets.py` consumed from its geom JSON:
     kind == 'line'  -> data is a list of (x, y) points (a polyline)
     kind == 'hatch' -> data is a list of polygons, each a list of (x, y)
-    block           -> originating block name (used to drop loose furniture)
+    block           -> originating block name (carried through; loose furniture
+                       is dropped earlier, during entity collection, not here)
 """
 
 import math
@@ -240,11 +241,20 @@ class ParseError(Exception):
     """Raised when a DXF cannot be turned into a usable floor plan."""
 
 
+# A fragment counts as furniture only when it stands as its own token: not
+# preceded by a letter/digit (so a unit code like "2BED" is NOT furniture) and
+# not followed by a letter (so "BEDROOM" is NOT furniture). Delimiters and
+# trailing digits are fine, so real furniture blocks ("BED-01", "M_SOFA",
+# "SOFA2", "CABINET-LOOSE") still match.
+_FURNITURE_RE = re.compile(
+    r"(?<![A-Z0-9])(?:" + "|".join(re.escape(f) for f in FURNITURE_FRAGMENTS)
+    + r")(?![A-Z])")
+
+
 def _is_furniture(block_name: str) -> bool:
     if not block_name:
         return False
-    up = block_name.upper()
-    return any(frag in up for frag in FURNITURE_FRAGMENTS)
+    return bool(_FURNITURE_RE.search(block_name.upper()))
 
 
 def _clean_text(raw: str | None) -> str:
@@ -309,13 +319,18 @@ def _collect_entities(entity, block_name, depth, out_geom, out_text, role_sets):
         # or becomes a re-addable label, but it is still scanned for metadata
         # suggestions — a Revit area/suite/title tag commonly sits on a drop
         # layer (A-AREA-IDEN) yet describes the unit. Reading != rendering.
+        if len(out_text) >= MAX_PRIMS:   # bound text too (geometry has MAX_PRIMS)
+            return
         try:
             raw = entity.text if dxftype == "MTEXT" else entity.dxf.text
             ins = entity.dxf.insert
+            tx, ty = float(ins[0]), float(ins[1])
+            if not (math.isfinite(tx) and math.isfinite(ty)):
+                return                         # NaN/inf insert -> would crash place()
             out_text.append({
                 "text": _clean_text(raw),
-                "x": float(ins[0]),
-                "y": float(ins[1]),
+                "x": tx,
+                "y": ty,
                 "layer": layer,
                 "is_label_layer": layer in label_layers,
                 "drop": layer in drop_layers,

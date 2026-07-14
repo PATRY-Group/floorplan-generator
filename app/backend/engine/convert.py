@@ -68,7 +68,10 @@ def dwg_to_dxf(dwg_path, out_dir=None, dxf_version="ACAD2018"):
     try:
         shutil.copy(dwg_path, os.path.join(in_dir, base + ".dwg"))
 
-        cmd = [converter, in_dir, out_dir, dxf_version, "DXF", "0", "1", "*.DWG"]
+        # Filter case must match the copied file's extension: ODA's Qt name
+        # filter is case-sensitive on some Linux builds, so "*.DWG" would miss the
+        # lowercase "base.dwg" we just wrote and report "no DXF output".
+        cmd = [converter, in_dir, out_dir, dxf_version, "DXF", "0", "1", "*.dwg"]
         try:
             subprocess.run(cmd, check=True, capture_output=True, timeout=120)
         except subprocess.CalledProcessError as exc:

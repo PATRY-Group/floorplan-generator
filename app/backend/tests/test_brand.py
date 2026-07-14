@@ -48,6 +48,25 @@ class PaletteRoleTest(unittest.TestCase):
         self.assertNotEqual(roles["accent"], "#2A0A00")
 
 
+class TransparentBackgroundTest(unittest.TestCase):
+    def test_transparent_background_flattens_to_white_not_black(self):
+        """An RGBA logo on a transparent background must composite onto white, so
+        the empty background reads as 'light' (near-white). Flattening onto black
+        (PIL's default RGBA->RGB) made a transparent logo look black-dominant and
+        mis-picked dark/light."""
+        import io
+        from PIL import Image
+        im = Image.new("RGBA", (80, 80), (0, 0, 0, 0))     # fully transparent
+        for x in range(40):
+            for y in range(40):
+                im.putpixel((x, y), (200, 90, 30, 255))    # one opaque orange block
+        buf = io.BytesIO()
+        im.save(buf, "PNG")
+        out = extract_brand(buf.getvalue(), "logo.png")
+        r, g, b = (int(out["palette"]["light"].lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+        self.assertGreater((r + g + b) / 3, 180)           # near-white, not near-black
+
+
 class FontNameTest(unittest.TestCase):
     def test_strips_pdf_subset_prefix(self):
         self.assertEqual(_clean_font_name("ABCDEF+HelveticaNeue-Bold"),
