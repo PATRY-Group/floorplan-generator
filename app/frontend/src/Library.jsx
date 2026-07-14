@@ -100,15 +100,20 @@ export default function Library({ sheets, onReopen, onDelete, onRename, onBatchD
   // Switching the property chip clears it (you're working within one property).
   useEffect(() => setSelected(new Set()), [prop]);
 
-  // Persist the sticky preferences so they survive unmount/reload.
-  useEffect(() => { localStorage.setItem(SORT_KEY, sort); }, [sort]);
-  useEffect(() => { localStorage.setItem(FILTER_KEY, prop); }, [prop]);
+  // Persist the sticky preferences so they survive unmount/reload. Guarded:
+  // setItem throws at quota / in private-mode, and an uncaught throw in an effect
+  // would unmount the app (no error boundary).
+  useEffect(() => { try { localStorage.setItem(SORT_KEY, sort); } catch { /* ignore */ } }, [sort]);
+  useEffect(() => { try { localStorage.setItem(FILTER_KEY, prop); } catch { /* ignore */ } }, [prop]);
 
   // A persisted filter can point at a property with no sheets anymore (all
   // deleted, or a different dataset). Fall back to "All" so the grid isn't
   // silently empty with no chip to recover — chips only show with 2+ properties.
   useEffect(() => {
-    if (prop && !sheets.some((s) => s.property_id === prop)) setProp("");
+    // Guard on sheets being loaded (non-empty): running while `sheets` is still
+    // [] (before /sheets resolves — a restored session can land here first)
+    // would reset — and re-persist as "" — a perfectly valid saved filter.
+    if (sheets.length && prop && !sheets.some((s) => s.property_id === prop)) setProp("");
   }, [sheets, prop]);
 
   function exitSelecting() {

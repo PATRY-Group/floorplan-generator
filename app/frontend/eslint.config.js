@@ -1,8 +1,9 @@
 // Flat ESLint config (ESLint 9). Focus: catch real bugs and the issues this
 // codebase has had — hooks misuse / stale deps (react-hooks), accessibility gaps
 // on interactive elements (jsx-a11y), and missing list keys (react). Run with
-// `npm run lint`. Not wired into CI yet — it surfaces warnings on existing code
-// to clean up incrementally rather than block the build.
+// `npm run lint`, which also runs in CI (see .github/workflows/test.yml). Most
+// findings are warnings (they don't fail the build) so existing code can be
+// cleaned up incrementally; only errors block.
 //
 // Only the two classic react-hooks rules are enabled (rules-of-hooks +
 // exhaustive-deps); react-hooks 7.x also ships aggressive React-Compiler rules

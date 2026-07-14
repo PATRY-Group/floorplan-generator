@@ -119,6 +119,7 @@ export default function PropertySetup({ initial, seedLayerMap, onClose, onSaved,
   const [lockTouched, setLockTouched] = useState(!!initial?.lockup);
   const [wmTouched, setWmTouched] = useState(!!initial?.watermark);
   const [typeMode, setTypeMode] = useState({});   // role -> show the installed-name text box
+  const [layerText, setLayerText] = useState({}); // role -> raw text while editing (commit on blur)
 
   const set = (k, v) => setP((o) => ({ ...o, [k]: v }));
   const setPal = (k, v) => setP((o) => ({ ...o, palette: { ...o.palette, [k]: v } }));
@@ -436,7 +437,7 @@ export default function PropertySetup({ initial, seedLayerMap, onClose, onSaved,
                 </div>
               </div>
             )}
-            <div className="swatch">
+            <div className="brand-preview">
               <div className="sw-head" style={{ background: pal.dark }}>
                 <span style={{ color: pal.accent, fontFamily: "Georgia, serif", fontWeight: "bold" }}>
                   {p.lockup || "—"}
@@ -484,8 +485,16 @@ export default function PropertySetup({ initial, seedLayerMap, onClose, onSaved,
               <div key={role}>
                 <label>{label}</label>
                 <input type="text"
-                  value={(p.layer_map[role] || []).join(", ")}
-                  onChange={(e) => setLayers(role, e.target.value)} />
+                  // Edit as raw text so a comma (a layer separator) is typeable;
+                  // parse into the array only on blur. Parsing every keystroke
+                  // stripped the trailing comma and jumped the caret, making a
+                  // second layer impossible to type.
+                  value={layerText[role] ?? (p.layer_map[role] || []).join(", ")}
+                  onChange={(e) => setLayerText((t) => ({ ...t, [role]: e.target.value }))}
+                  onBlur={(e) => {
+                    setLayers(role, e.target.value);
+                    setLayerText((t) => { const n = { ...t }; delete n[role]; return n; });
+                  }} />
               </div>
             ))}
           </section>

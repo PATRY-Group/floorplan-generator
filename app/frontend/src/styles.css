@@ -898,7 +898,7 @@ select, input[type="text"] {
 .palmeta { font-size: 11px; color: var(--muted); line-height: 1.4; }
 .palmeta b { color: var(--ink); }
 
-.swatch {
+.brand-preview {
   margin-top: 12px; border-radius: 6px; overflow: hidden;
   border: 1px solid var(--line);
 }

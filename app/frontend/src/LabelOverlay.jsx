@@ -80,7 +80,7 @@ export default function LabelOverlay({
     // Remember where on the handle we grabbed so the label tracks the cursor
     // from that point instead of snapping its anchor under the pointer. sx/sy
     // record the start position so endDrag can tell a click from a real drag.
-    setDrag({ i: p.i, x: p.px, y: p.py, sx: p.px, sy: p.py, ox: vx - p.px, oy: vy - p.py });
+    setDrag({ i: p.i, rid: p.rid, x: p.px, y: p.py, sx: p.px, sy: p.py, ox: vx - p.px, oy: vy - p.py });
   }
   function onPointerMove(e) {
     if (!drag || !wrapRef.current) return;
@@ -93,7 +93,7 @@ export default function LabelOverlay({
     // threshold (viewBox px); a sub-threshold drag is just a selecting click.
     if (Math.hypot(drag.x - drag.sx, drag.y - drag.sy) >= 3) {
       const [dx, dy] = toDxf(drag.x, drag.y);
-      onMove(drag.i, dx, dy);
+      onMove(drag.rid, dx, dy);
     }
     setDrag(null);
   }
@@ -113,7 +113,7 @@ export default function LabelOverlay({
     const nx = base.x + d[0], ny = base.y + d[1];
     setPending({ i: selected, x: nx, y: ny });
     const [dx, dy] = toDxf(nx, ny);
-    onMove(selected, dx, dy);
+    onMove(p.rid, dx, dy);
   }
 
   const wm = meta && meta.watermark_svg;
@@ -172,7 +172,7 @@ export default function LabelOverlay({
               style={{ left, top }}
               onPointerDown={(e) => startDrag(e, p)}
               onClick={(e) => { e.stopPropagation(); setSelected(p.i); wrapRef.current?.focus(); }}
-              onDoubleClick={() => onReset(p.i)}
+              onDoubleClick={() => onReset(p.rid)}
             >
               {live
                 ? <span className="dragghost">{p.name}</span>

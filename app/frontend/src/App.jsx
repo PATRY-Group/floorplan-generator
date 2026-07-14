@@ -22,6 +22,9 @@ function docSig(d) {
   return JSON.stringify({
     propertyId: d.propertyId, rooms: d.rooms, ignored: d.ignored,
     meta: d.meta, keyplan: d.keyplan,
+    // Paint is baked into the saved artifact, so a paint-only change is a real
+    // unsaved change — include it or "save → paint → close" discards silently.
+    paintImage: d.paintImage,
   });
 }
 // A tab has work worth warning about if it carries parsed geometry and was
@@ -50,7 +53,7 @@ const exportName = (propId, title, suffix = "") => {
 // Unit name derived from the uploaded filename. DXF titleblocks often share a
 // generic label (e.g. every unit's sheet says "2 BED"), so the filename is the
 // only reliable per-unit distinguisher. When a " - " / " – " separator is present
-// we take the trailing segment ("Amrstrong - Unit 2-E" -> "Unit 2-E"), dropping a
+// we take the trailing segment ("Armstrong - Unit 2-E" -> "Unit 2-E"), dropping a
 // shared building/property prefix; otherwise we keep the whole base name. Never
 // returns empty — an empty title would fall through to the generic DXF guess and
 // reintroduce the duplicate-title problem.
@@ -121,10 +124,20 @@ function parsedDocFields(d, fileName) {
       ? Object.fromEntries(d.layer_report.map((r) => [r.layer, r.role || ""]))
       : null,
     parseError: "",
+    renderError: "",
     svg: "",
+    placement: null,
     savedId: null,
+    // Reset per-unit artifacts to newDoc() defaults: re-uploading a new file into
+    // a clean (saved) tab takes the in-place path, so stale render meta, keyplan,
+    // or paint from the previous unit would otherwise be inherited (and the paint
+    // baked into exports).
+    keyplan: null,
+    keyplanSvg: null,
+    paintImage: null,
     meta: {
       title: titleFromFileName(fileName) || (d.suggestions && d.suggestions.title) || guessTitle(d.labels),
+      footer_name: "",
       suite: (d.suggestions && d.suggestions.suite) || "",
       sf: (d.suggestions && d.suggestions.sf) || "",
     },
@@ -148,9 +161,17 @@ function parsedPdfDocFields(d, fileName) {
     layerMapUsed: null,
     layerRoles: null,
     parseError: "",
+    renderError: "",
     svg: "",
+    placement: null,
     savedId: null,
-    meta: { title: titleFromFileName(fileName) || "", suite: "", sf: "" },
+    // Reset per-unit artifacts to newDoc() defaults (see parsedDocFields): a
+    // re-upload into a clean tab must not inherit the previous unit's render meta,
+    // keyplan, or paint.
+    keyplan: null,
+    keyplanSvg: null,
+    paintImage: null,
+    meta: { title: titleFromFileName(fileName) || "", footer_name: "", suite: "", sf: "" },
   };
 }
 
@@ -244,6 +265,8 @@ export default function App() {
   const renderSeq = useRef({});  // per-doc latest-wins guard (keyed by doc id) so a slow /render can't clobber a newer one for the SAME doc
   const autosaveWarnedRef = useRef(false);  // toast at most once if autosave hits the localStorage quota
   const previewAbort = useRef(null);  // AbortController for the in-flight live-preview render, cancelled when a newer one starts
+  const previewGen = useRef(0);  // global preview generation, so only the latest preview clears the (global) "Rendering…" flag — not a per-doc one
+  const savingDocs = useRef({});  // per-doc "a save is in flight" flag so a double-click can't fire two concurrent saves of the same doc
 
   const active = docs.find((d) => d.id === activeId) || null;
   const propertyId = active ? active.propertyId : defaultProp;
@@ -287,7 +310,12 @@ export default function App() {
       const initial = (last && p.find((x) => x.id === last)) ? last : (p[0] ? p[0].id : "");
       setDefaultProp(initial);
       restoreSession(initial);
-    }).catch(() => restoreSession(""));
+    }).catch(() => {
+      // Backend unreachable at boot: surface it instead of silently showing an
+      // empty "(no properties configured)" state, then still restore local work.
+      toast("Couldn't reach the server — properties may be unavailable. Check the backend and reload.", "error");
+      restoreSession("");
+    });
   }, []);
 
   function restoreSession(initialProp) {
@@ -314,9 +342,16 @@ export default function App() {
     setActiveId(d.id);
   }
 
-  useEffect(() => { if (defaultProp) localStorage.setItem(LS_PROP, defaultProp); }, [defaultProp]);
+  // These are tiny sticky-preference writes, but localStorage.setItem throws at
+  // quota (or in private-mode browsers) — an uncaught throw inside an effect
+  // unmounts the app (there's no error boundary), so swallow it.
   useEffect(() => {
-    localStorage.setItem(LS_UI, JSON.stringify({ panelW, collapsed, tabOrient, railW, railCollapsed }));
+    try { if (defaultProp) localStorage.setItem(LS_PROP, defaultProp); } catch { /* ignore */ }
+  }, [defaultProp]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_UI, JSON.stringify({ panelW, collapsed, tabOrient, railW, railCollapsed }));
+    } catch { /* ignore */ }
   }, [panelW, collapsed, tabOrient, railW, railCollapsed]);
 
   // Track viewport width so vertical tabs can auto-fall back to horizontal when
@@ -350,7 +385,7 @@ export default function App() {
     if (!docs.length) return;
     const t = setTimeout(() => {
       const slim = docs.map((d) => ({
-        id: d.id, propertyId: d.propertyId, docId: d.docId, fileName: d.fileName,
+        id: d.id, kind: d.kind, propertyId: d.propertyId, docId: d.docId, fileName: d.fileName,
         savedId: d.savedId, savedSig: d.savedSig, rooms: d.rooms, deletedRooms: d.deletedRooms, ignored: d.ignored,
         meta: d.meta, suggestions: d.suggestions, warnings: d.warnings,
         keyplan: d.keyplan, showHandles: d.showHandles, paintImage: d.paintImage,
@@ -383,9 +418,17 @@ export default function App() {
 
   // Unified library: every saved sheet across all properties, refreshed on
   // mount and whenever the library tab is opened (and after save/delete/rename).
-  const refreshSheets = () => listAllSheets().then(setSheets).catch(() => {});
+  const refreshSheets = () => listAllSheets().then(setSheets).catch(
+    () => toast("Couldn't load the saved-sheet library — check the backend.", "error"));
   useEffect(() => { refreshSheets(); }, []);
-  useEffect(() => { if (activeId === "library") refreshSheets(); }, [activeId]);
+  // Refetch when the Library tab is *opened*, but skip the first run: the mount
+  // effect above already fetched, and both effects fire on mount — so a restored
+  // session that lands on the Library tab otherwise double-fetches /sheets.
+  const sheetsMounted = useRef(false);
+  useEffect(() => {
+    if (!sheetsMounted.current) { sheetsMounted.current = true; return; }
+    if (activeId === "library") refreshSheets();
+  }, [activeId]);
 
   // Ctrl/Cmd+Z restores the last deleted room of the active doc, unless a text
   // field is focused (so native input undo keeps working).
@@ -430,6 +473,7 @@ export default function App() {
     return listProperties().then((p) => {
       setProperties(p);
       if (selectId) setDefaultProp(selectId);
+      return p;
     });
   }
 
@@ -472,6 +516,10 @@ export default function App() {
     setCloseConfirm(null);
   }
   async function saveAndClose(id) {
+    // A save already in flight for this tab (e.g. a double-click) makes doRender
+    // return null via its guard — that's not a failure, so don't show the error
+    // toast; let the running save finish.
+    if (savingDocs.current[id]) return;
     const sid = await doRender(true, false, id);
     if (sid) { closeTab(id); applySuppressAndReset(); }
     else toast("Couldn’t save — the tab was kept open", "error");   // dialog stays up so the user can retry or close anyway
@@ -494,11 +542,24 @@ export default function App() {
 
   async function handleFile(file) {
     if (!file) return;
+    if (parsing) return;   // one parse at a time — don't race the shared `parsing` flag
+    // PDF and raster images (PNG/JPG) are already-finished plans -> image-plan path.
+    const isPlanImg = /\.(pdf|png|jpe?g)$/i.test(file.name);
+    // Client-side size guard mirroring the backend caps (60 MB DXF/DWG, 25 MB
+    // image/PDF) so an oversized file fails fast instead of a slow upload → 413.
+    const maxMb = isPlanImg ? 25 : 60;
+    if (file.size > maxMb * 1024 * 1024) {
+      toast(`That file is over ${maxMb} MB. Upload a single-unit plan, not a whole floor.`, "error");
+      return;
+    }
     let id = activeId;
     let prop = active ? active.propertyId : defaultProp;
     // Open a fresh tab when there's no active editor (Library tab) OR when the
     // active tab holds unsaved parsed work — parsing the new file in place would
     // silently discard those edits. (Mirrors batch upload, which always tabs.)
+    // Otherwise it's an in-place re-upload of a clean saved tab: remember its
+    // state so a failed parse restores it instead of destroying a good tab.
+    const inPlacePrior = (active && !isDirty(active)) ? active : null;
     if (!active || isDirty(active)) {
       if (active) toast("Opened in a new tab to keep your unsaved changes.", "info");
       const d = newDoc(active ? active.propertyId : defaultProp);
@@ -507,10 +568,9 @@ export default function App() {
       setActiveId(d.id);
     }
     setParsing(true);
-    patchDoc(id, { fileName: file.name, parseError: "", svg: "", savedId: null });
-    const isPdf = file.name.toLowerCase().endsWith(".pdf");
+    patchDoc(id, { fileName: file.name, parseError: "" });
     try {
-      if (isPdf) {
+      if (isPlanImg) {
         const d = await parsePlanPdf(file);
         patchDoc(id, { ...parsedPdfDocFields(d, file.name), fileObj: null });
       } else {
@@ -519,7 +579,11 @@ export default function App() {
       }
       setOpenSection("details");
     } catch (e) {
-      patchDoc(id, { docId: null, rooms: [], parseError: e.message });
+      // Restore a clean saved tab to its pre-upload state (keep its geometry,
+      // preview and library link) rather than blanking it; new/empty tabs just
+      // show the error. Either way surface the message.
+      if (inPlacePrior) patchDoc(id, { ...inPlacePrior, parseError: e.message });
+      else patchDoc(id, { docId: null, rooms: [], parseError: e.message });
       toast(e.message, "error");
     } finally {
       setParsing(false);
@@ -623,8 +687,12 @@ export default function App() {
   // tells the user to re-upload — instead of surfacing a cryptic raw message.
   // Returns true if it handled the error (caller should not surface it further).
   function handleExpiredUpload(d, e) {
-    if (!/expired|not found/i.test(e.message)) return false;
-    toast("This unit's upload expired — re-upload the DXF.", "error");
+    // Match only the /render path's expiry message ("Upload expired or not
+    // found."), NOT any error containing "not found" — a missing property/sheet
+    // would otherwise nuke a healthy session.
+    if (!/upload expired/i.test(e.message)) return false;
+    const what = d.kind === "image" ? "file" : "DXF";
+    toast(`This unit's upload expired — re-upload the ${what}.`, "error");
     patchDoc(d.id, { docId: null });
     return true;
   }
@@ -632,16 +700,26 @@ export default function App() {
   async function doRender(save, asNew = false, id = activeId) {
     const d = docs.find((x) => x.id === id);
     if (!d || !d.docId) return null;
+    // A save runs in the background (unsignalled, so it always completes) while
+    // the user keeps editing — guard against a double-click firing two concurrent
+    // saves of the same doc, which would race on the same sheet_id/index entry.
+    if (save) {
+      if (savingDocs.current[d.id]) return null;
+      savingDocs.current[d.id] = true;
+      toast("Saving to the library…", "info");
+    }
     const mySeq = (renderSeq.current[d.id] = (renderSeq.current[d.id] || 0) + 1);   // claim the latest slot for THIS doc's preview output
     // Cancel a still-in-flight live preview when a newer one starts — saves the
     // backend the wasted render. (renderSeq already stops a stale *response* from
     // clobbering fresher geometry; this stops the *request*.) Saves and exports
     // run unsignalled so they always complete.
     let signal;
+    let myPreviewGen = 0;
     if (!save) {
       if (previewAbort.current) previewAbort.current.abort();
       previewAbort.current = new AbortController();
       signal = previewAbort.current.signal;
+      myPreviewGen = ++previewGen.current;   // global: newest preview owns the flag
     }
     if (save) setSaving(true); else setRendering(true);
     try {
@@ -657,6 +735,15 @@ export default function App() {
         live_preview: !save,
       }, signal);
       const latest = mySeq === renderSeq.current[d.id];
+      // Tag each placement with the stable rid of the room it belongs to (backend
+      // placements are positional — placement.i indexes the rooms we just sent).
+      // The overlay commits moves by rid, so deleting a room mid-render can't make
+      // a drag land on the wrong (shifted) room.
+      const annotatedMeta = res.meta ? {
+        ...res.meta,
+        placements: (res.meta.placements || []).map(
+          (pl) => ({ ...pl, rid: d.rooms[pl.i] && d.rooms[pl.i].rid })),
+      } : null;
       patchDoc(d.id, {
         // only the newest render may repaint the preview — an earlier response
         // resolving after a newer one must not overwrite fresher geometry
@@ -666,7 +753,7 @@ export default function App() {
           // shows it). A save bakes both into res.svg for the library/export, so
           // swapping it in would double the paint AND the watermark.
           ...(save ? {} : { svg: res.svg }),
-          placement: res.meta || d.placement,
+          placement: annotatedMeta || d.placement,
           keyplanSvg: res.keyplan_svg || null, renderError: "",
         } : {}),
         // a completed save is a committed server action: always record it, even
@@ -682,24 +769,39 @@ export default function App() {
       return save && res.sheet_id ? res.sheet_id : null;
     } catch (e) {
       if (e.name === "AbortError") return null;   // superseded preview — cancelled on purpose, not an error
-      // surface save failures always; suppress errors from a stale preview
-      if (!handleExpiredUpload(d, e) && (save || mySeq === renderSeq.current[d.id])) {
+      if (handleExpiredUpload(d, e)) return null;  // expired upload clears the session (its own toast)
+      if (save) {
+        // A background save that fails must be loud and recoverable — the user
+        // has moved on, so a silent inline error would read as "saved". Offer a
+        // one-tap retry (re-runs this exact save; the guard is already cleared
+        // in finally before the toast can fire).
+        toast(`Couldn't save: ${e.message}`, "error",
+          { label: "Retry", run: () => doRender(save, asNew, id) });
+      } else if (mySeq === renderSeq.current[d.id]) {
         patchDoc(d.id, { renderError: e.message });
       }
       return null;
     } finally {
-      if (save) setSaving(false);
-      // only the latest preview clears the spinner, so an aborted/superseded
-      // older request's finally can't hide "Rendering…" while the newer one runs
-      else if (mySeq === renderSeq.current[d.id]) setRendering(false);
+      if (save) { savingDocs.current[d.id] = false; setSaving(false); }
+      // Only the newest preview (global generation, not per-doc) clears the
+      // spinner: a superseded older request — including one whose tab has since
+      // closed — must not hide "Rendering…" while a newer preview is still in
+      // flight, and the newest always runs its finally last.
+      else if (myPreviewGen === previewGen.current) setRendering(false);
     }
   }
 
   // ---- room edits (active doc) --------------------------------------------
   const updateRoom = (i, p) =>
     patchActive((d) => ({ rooms: d.rooms.map((r, j) => (j === i ? { ...r, ...p } : r)) }));
-  const moveLabel = (i, x, y) => updateRoom(i, { x, y });
-  const resetLabel = (i) => updateRoom(i, { x: null, y: null });
+  // Label moves/resets come from the overlay keyed by rid (not index): the
+  // placement it acted on may no longer be at that index if a room was deleted
+  // between the last render and the commit. A missing rid is a no-op, never a
+  // wrong-room write.
+  const updateRoomByRid = (rid, p) =>
+    patchActive((d) => ({ rooms: d.rooms.map((r) => (r.rid === rid ? { ...r, ...p } : r)) }));
+  const moveLabel = (rid, x, y) => updateRoomByRid(rid, { x, y });
+  const resetLabel = (rid) => updateRoomByRid(rid, { x: null, y: null });
   function revertLabels() {
     if (!active) return;
     const id = active.id;
@@ -778,7 +880,7 @@ export default function App() {
   // ---- export --------------------------------------------------------------
   async function downloadCurrentSvg() {
     const d = docs.find((x) => x.id === activeId);
-    if (!d || !d.docId || !d.svg) return;
+    if (!d || !d.docId || !d.svg) return false;
     // Re-render server-side so the export bakes the full sheet: the live preview
     // svg omits both the paint (the canvas overlay shows it) and the watermark
     // (the wm-overlay shows it), so d.svg alone is not export-ready. Mirrors the
@@ -795,7 +897,7 @@ export default function App() {
     } catch (e) {
       if (!handleExpiredUpload(d, e)) toast(e.message, "error");
       setPngBusy(false);
-      return;
+      return false;
     }
     setPngBusy(false);
     const blob = new Blob([svgOut], { type: "image/svg+xml" });
@@ -805,10 +907,11 @@ export default function App() {
     a.download = `${exportName(d.propertyId, d.meta.title)}.svg`;
     a.click();
     URL.revokeObjectURL(url);
+    return true;
   }
   async function downloadCurrentPng() {
     const d = docs.find((x) => x.id === activeId);
-    if (!d || !d.docId) return;
+    if (!d || !d.docId) return false;
     setPngBusy(true);
     try {
       const res = await renderSheet({
@@ -1490,7 +1593,7 @@ export default function App() {
               </div>
             </div>
             {active.svg
-              ? <LabelOverlay svg={active.svg} meta={active.placement}
+              ? <LabelOverlay key={active.id} svg={active.svg} meta={active.placement}
                   showHandles={active.showHandles && !active.paintMode}
                   onMove={moveLabel} onReset={resetLabel}
                   zoom={zoom} onZoom={setZoom}
@@ -1524,7 +1627,13 @@ export default function App() {
           onDeleted={(p) => {
             setEditing(null);
             setSeedLayer(null);
-            refreshProperties();
+            // Clear dangling references to the deleted property: point new
+            // uploads at a remaining property (or none), and blank it on any open
+            // doc so its Property <select> and renders don't post a dead id.
+            refreshProperties().then((list) => {
+              setDefaultProp((cur) => (cur === p.id ? (list[0] ? list[0].id : "") : cur));
+              setDocs((ds) => ds.map((d) => (d.propertyId === p.id ? { ...d, propertyId: "" } : d)));
+            });
             toast(`Property "${p.name || p.id}" deleted`, "success");
           }}
         />
