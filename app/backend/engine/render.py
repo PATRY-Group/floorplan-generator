@@ -65,15 +65,19 @@ from PIL import Image, ImageDraw
 from .keyplan import keyplan_group, img_size
 from .keyplan_trace import solidify_walls, _hex
 
-PAGE_W, PAGE_H = 1000, 1080
+# Page is US Letter portrait proportions (8.5:11 -> 1000:1294) so the exported PDF
+# is a true 8.5x11. The header/footer bands and all their content are unchanged —
+# the extra height over the old near-square page falls as cream space in the plan
+# area, so the branded bands stay pixel-identical to before.
+PAGE_W, PAGE_H = 1000, 1294
 # Raster width the branded sheet PNG is rendered at. The sheet is vector SVG, so
 # this only sets output sharpness — well above the 1000px viewBox for crisp
 # fixtures/type when zoomed or printed. Mirrored by main.py's resvg re-render
 # (the custom-font path), so keep the two in sync via this constant.
 SHEET_PNG_W = 2000
-HEADER_H = 92
-FOOTER_H = 140
-PLAN_MAX_W, PLAN_MAX_H = 800, 640
+HEADER_H = 158   # header band height; content re-centres via hpad = (HEADER_H-92)/2
+FOOTER_H = 185
+PLAN_MAX_W, PLAN_MAX_H = 860, 700
 SKINNY_WALL_W = 0.8   # wall-outline stroke for the "skinny" (no-fill) wall style
 
 DEFAULT_SERIF = "Georgia, 'Times New Roman', serif"
@@ -225,10 +229,11 @@ def _poche_close_k(plan_w, plan_h, override=None):
     return max(7, math.ceil(0.006 * max(plan_w, plan_h)))
 
 
-def _wall_band_mask(wall_lines, cavity_lines, close_k):
+def _wall_band_mask(wall_lines, cavity_lines, close_k, page_w, page_h):
     """Rasterize wall linework (already in page coords) at page resolution and
     solidify the double-line faces into one filled band. Returns a boolean
-    (PAGE_H, PAGE_W) mask, cached by geometry+kernel."""
+    (page_h, page_w) mask, cached by geometry+kernel."""
+    PAGE_W, PAGE_H = page_w, page_h
     h = hashlib.md5(str(close_k).encode())
     for tag, lines in ((b"W", wall_lines), (b"C", cavity_lines)):
         for line in lines:
@@ -251,15 +256,17 @@ def _wall_band_mask(wall_lines, cavity_lines, close_k):
 
 
 def _wall_poche_image(wall_lines, cavity_lines, plan_w, plan_h, wall_hex,
-                      close_override=None):
-    """Solid-wall poché synthesized from wall linework, as a full-page (PAGE_W x
-    PAGE_H) base64 PNG <image> tag positioned in page coords — transparent except
+                      page_w, page_h, close_override=None):
+    """Solid-wall poché synthesized from wall linework, as a full-page (page_w x
+    page_h) base64 PNG <image> tag positioned in page coords — transparent except
     the wall band, so it overlays cleanly under the crisp vector wall strokes in
     either export path. Returns None if there is no wall geometry."""
+    PAGE_W, PAGE_H = page_w, page_h
     if not (wall_lines or cavity_lines):
         return None
     band = _wall_band_mask(wall_lines, cavity_lines,
-                           _poche_close_k(plan_w, plan_h, close_override))
+                           _poche_close_k(plan_w, plan_h, close_override),
+                           page_w, page_h)
     if not band.any():
         return None
     rgba = np.zeros((PAGE_H, PAGE_W, 4), np.uint8)
@@ -280,7 +287,7 @@ def _role_lookup(layer_map):
 
 
 def _brand_chrome(config, palette, DARK, ACCENT, MID, LIGHT, SERIF, SERIF_NAME, SANS,
-                  plan_top, plan_h):
+                  plan_top, plan_h, page_w, page_h, header_h, footer_h, fcs):
     """Everything in the branded header/footer band that depends only on
     metadata/palette/fonts, not on the plan's own geometry (walls vs. a raster
     image) beyond the plan's centered box (plan_top/plan_h). Shared by render()
@@ -288,14 +295,33 @@ def _brand_chrome(config, palette, DARK, ACCENT, MID, LIGHT, SERIF, SERIF_NAME, 
     unlike keyplan.py's render_keyplan_sheet, which duplicates a much smaller,
     static frame for a different, standalone-page use case."""
     esc = html.escape
+    PAGE_W, PAGE_H = page_w, page_h          # local shadow: orientation-aware page size
+    HEADER_H, FOOTER_H = header_h, footer_h  # effective band heights (shrunk in landscape)
+    # Header content re-centres vertically in the band; scale the 92px design baseline
+    # by fcs so the landscape (shrunk) chrome stays proportional. fcs=1.0 => unchanged.
+    hpad = (HEADER_H - 92 * fcs) / 2.0
     md = config.get("metadata") or {}          # unit metadata (title/suite/…)
-    title = esc((md.get("title") or "").upper())
+    # Footer heading: the separate "shown on sheet footer" name if set, else the
+    # sheet name (`title`) — which is also what pre-split sheets carry, so old
+    # sheets and an empty footer field both render the sheet name unchanged.
+    title = esc(((md.get("footer_name") or md.get("title")) or "").upper())
     suite = esc(md.get("suite") or "")
-    sf = esc(md.get("sf") or "")
+    # Square footage: when the "append SF" toggle is on (default) and the typed
+    # value is a bare number, tack on " SF" — so the coordinator can type just the
+    # number. Only append to a purely numeric value, so an already-united entry
+    # ("795 SF", "795 SQFT", "72 m²") isn't doubled into "795 SQFT SF".
+    sf_raw = (md.get("sf") or "").strip()
+    if md.get("sf_unit", True) and sf_raw and re.fullmatch(r"[\d.,\s]+", sf_raw):
+        sf_raw = f"{sf_raw} SF"
+    sf = esc(sf_raw)
     prop_name = esc((md.get("property_name") or "").upper())
     location = esc((md.get("location") or "").upper())
-    lockup = esc(md.get("lockup") or "")
-    watermark = esc(md.get("watermark") or lockup or "")
+    lockup_raw = md.get("lockup") or ""
+    lockup = esc(lockup_raw)
+    # Escape once: fall back to the RAW lockup, not the already-escaped one, or
+    # "A&B" becomes the literal "A&amp;amp;B".
+    watermark_raw = md.get("watermark") or lockup_raw or ""
+    watermark = esc(watermark_raw)
     # Centered ghost watermark behind the plan: an uploaded image if provided,
     # otherwise the text mark sized to fit the page width (so a longer mark like
     # "2274" scales down instead of overflowing the fixed 430px size).
@@ -318,7 +344,7 @@ def _brand_chrome(config, palette, DARK, ACCENT, MID, LIGHT, SERIF, SERIF_NAME, 
             f'y="{wm_cy - wm_box / 2:.0f}" width="{wm_box:.0f}" height="{wm_box:.0f}" '
             f'opacity="0.08" preserveAspectRatio="xMidYMid meet"/>')
     elif watermark:
-        wm_size = min(430.0, 1500.0 / max(len(watermark), 1))
+        wm_size = min(430.0, 1500.0 / max(len(watermark_raw), 1))   # size off the real length, not the escaped one
         watermark_svg = (
             f'<text x="{wm_cx:.0f}" y="{wm_cy:.0f}" text-anchor="middle" '
             f'dominant-baseline="central" font-family="{SERIF}" font-weight="bold" '
@@ -371,7 +397,7 @@ def _brand_chrome(config, palette, DARK, ACCENT, MID, LIGHT, SERIF, SERIF_NAME, 
         try:
             _, b64 = wm_img.split(",", 1)
             iw, ih = img_size(base64.b64decode(b64))
-            logo_h = min(52.0, HEADER_H - 24.0)
+            logo_h = min(92.0 * fcs, HEADER_H - 24.0 * fcs)
             lockup_w = (iw / ih * logo_h) if ih else logo_h
             logo_y = (HEADER_H - logo_h) / 2
             lockup_svg = (f'<image href="{wm_img}" x="{lockup_x}" y="{logo_y:.1f}" '
@@ -384,45 +410,49 @@ def _brand_chrome(config, palette, DARK, ACCENT, MID, LIGHT, SERIF, SERIF_NAME, 
         # divider/name spacing adapts to the font instead of a fixed-width guess.
         _disp = next((f for f in (config.get("font_faces") or [])
                       if f.get("data") and (f.get("role") == "serif" or f.get("family") == SERIF_NAME)), None)
+        lock_fs = round(72 * fcs)
         if _disp:
             try:
-                lockup_w = _glyph_width(_disp["data"], lockup, 44, 0)
+                lockup_w = _glyph_width(_disp["data"], lockup, lock_fs, 0)
             except Exception:
-                lockup_w = _text_w(lockup, 44, 0)
+                lockup_w = _text_w(lockup, lock_fs, 0)
         else:
-            lockup_w = _text_w(lockup, 44, 0)
-        lockup_svg = (f'<text x="{lockup_x}" y="62" font-family="{SERIF}" '
-                      f'font-weight="bold" font-size="44" fill="{ACCENT}">{lockup}</text>')
-    divider_x = lockup_x + 12 + lockup_w
-    name_x = divider_x + 20
+            lockup_w = _text_w(lockup, lock_fs, 0)
+        lockup_svg = (f'<text x="{lockup_x}" y="{72 * fcs + hpad:.0f}" font-family="{SERIF}" '
+                      f'font-weight="bold" font-size="{lock_fs}" fill="{ACCENT}">{lockup}</text>')
+    divider_x = lockup_x + 12 * fcs + lockup_w
+    name_x = divider_x + 20 * fcs
 
     # ---- optional footer key-plan mini-plate -------------------------------
     keyplan = config.get("keyplan") or {}
     footer_kp_svg = ""
-    addr_x = PAGE_W - 60
-    floor_label_svg = ""
     if keyplan.get("plate_bytes") and keyplan.get("placement") == "footer":
         iw, ih = img_size(keyplan["plate_bytes"])
-        # Aspect-fit the (already-cropped) image into the footer slot so a
-        # portrait plan isn't stretched into a landscape box. Center it in the
-        # band ABOVE the disclaimer line (which sits at PAGE_H-18) so the plan
-        # never crowds the "SCHEMATIC, NOT TO SCALE" caption beneath it.
-        kp_max_w, kp_max_h = 150.0, 86.0
+        # User +/- sizing (keyplan["scale"], clamped). The plate is aspect-fit into a
+        # slot that runs from the top of the footer to just above the disclaimer line
+        # (kept clear of the fine print), centred, so any scale stays inside the band.
+        try:
+            kp_scale = float(keyplan.get("scale") or 1.0)
+        except (TypeError, ValueError):
+            kp_scale = 1.0
+        kp_scale = max(0.5, min(1.6, kp_scale))
+        region_top = (PAGE_H - FOOTER_H) + 12 * fcs
+        region_bot = (PAGE_H - FOOTER_H) + 135 * fcs   # above the disclaimer (~+145)
+        kp_max_w = 250.0 * fcs * kp_scale
+        kp_max_h = min(120.0 * fcs * kp_scale, region_bot - region_top)
         sc = min(kp_max_w / max(iw, 1), kp_max_h / max(ih, 1))
         kp_w, kp_h = iw * sc, ih * sc
         kp_ox = PAGE_W - 60 - kp_w
-        region_top = (PAGE_H - FOOTER_H) + 12
-        region_bot = PAGE_H - 30
         kp_oy = region_top + max(0.0, (region_bot - region_top - kp_h) / 2)
         footer_kp_svg = keyplan_group(keyplan["plate_bytes"],
-                                      kp_ox, kp_oy, kp_w, kp_h, palette)
-        addr_x = kp_ox - 24
-        fl = esc((keyplan.get("floor_label") or "").upper())
-        kp_cx = kp_ox + kp_w / 2
-        floor_label_svg = (
-            f'<text x="{kp_cx:.0f}" y="{PAGE_H-18}" text-anchor="middle" '
-            f'font-size="7" letter-spacing="2" fill="{MID}" '
-            f'fill-opacity="0.6">{fl} &#183; SCHEMATIC, NOT TO SCALE</text>')
+                                      kp_ox, kp_oy, kp_w, kp_h, palette,
+                                      box=keyplan.get("box"))
+    # Fine-print / disclaimer line, right-aligned on the SAME baseline as the footer
+    # address (+145) so the two share one line (address left, disclaimer right).
+    floor_label_svg = (
+        f'<text x="{PAGE_W-60}" y="{PAGE_H-FOOTER_H+round(145*fcs)}" text-anchor="end" '
+        f'font-size="{round(7*fcs,1):g}" letter-spacing="1" fill="{MID}" '
+        f'fill-opacity="0.6">SCHEMATIC FOR ILLUSTRATIVE PURPOSES ONLY. DIMENSIONS ARE APPROXIMATE.</text>')
 
     # In the live editor the watermark rides above the paint <canvas> as a
     # separate overlay (see meta["watermark_svg"]); leaving it out of the SVG
@@ -436,12 +466,57 @@ def _brand_chrome(config, palette, DARK, ACCENT, MID, LIGHT, SERIF, SERIF_NAME, 
         "footer_addr": footer_addr, "disclaimer": disclaimer,
         "divider_x": divider_x, "name_x": name_x,
         "footer_kp_svg": footer_kp_svg, "floor_label_svg": floor_label_svg,
-        "addr_x": addr_x, "sold_out_svg": sold_out_svg,
+        "sold_out_svg": sold_out_svg,
         "watermark_svg": watermark_svg, "wm_in_doc": wm_in_doc,
     }
 
 
+def _page_dims(config):
+    """Sheet layout for the orientation:
+    (page_w, page_h, header_h, footer_h, chrome_scale, plan_max_w, plan_max_h).
+
+    PORTRAIT is returned unchanged — the exact tuned constants, chrome_scale=1.0,
+    and the fixed PLAN_MAX box — so portrait output is byte-identical.
+
+    LANDSCAPE swaps W/H, shrinks the header/footer bands and their content by `cs`
+    (1/4 smaller) so they don't look chunky on the shorter page, and sizes the plan
+    DYNAMICALLY to fill the region between the bands (as wide as the page allows,
+    never running into a band)."""
+    if (config or {}).get("orientation") == "landscape":
+        cs = 0.75
+        pw, ph = PAGE_H, PAGE_W
+        hh, fh = round(HEADER_H * cs), round(FOOTER_H * cs)
+        return pw, ph, hh, fh, cs, pw - 110, (ph - hh - fh) - 60
+    return PAGE_W, PAGE_H, HEADER_H, FOOTER_H, 1.0, PLAN_MAX_W, PLAN_MAX_H
+
+
+def _chrome_header(ch, PAGE_W, HEADER_H, fcs, DARK, ACCENT, MID, SERIF):
+    """The branded top band: dark rect, lockup, accent divider, property name +
+    location, and the right-side label — vertically centred via hpad. Shared by the
+    floor-plan sheets and the standalone key-plan page so they never drift."""
+    hpad = (HEADER_H - 92 * fcs) / 2.0
+    return f'''  <rect width="{PAGE_W}" height="{HEADER_H}" fill="{DARK}"/>
+  {ch["lockup_svg"]}
+  <line x1="{ch["divider_x"]:.0f}" y1="{round(8*fcs)+hpad:.0f}" x2="{ch["divider_x"]:.0f}" y2="{round(84*fcs)+hpad:.0f}" stroke="{ACCENT}" stroke-width="{2*fcs:g}" stroke-opacity="0.7"/>
+  <text x="{ch["name_x"]:.0f}" y="{round(43*fcs)+hpad:.0f}" font-family="{SERIF}" font-size="{round(38*fcs)}" letter-spacing="{round(7*fcs,1):g}" fill="#FFFFFF">{ch["prop_name"]}</text>
+  <text x="{ch["name_x"]:.0f}" y="{round(73*fcs)+hpad:.0f}" font-size="{round(16*fcs)}" letter-spacing="{round(5.5*fcs,1):g}" fill="{MID}" fill-opacity="0.85">{ch["location"]}</text>
+  <text x="{PAGE_W-60}" y="{round(50*fcs)+hpad:.0f}" text-anchor="end" font-size="{round(12*fcs)}" letter-spacing="{round(3.5*fcs,1):g}" fill="{MID}" fill-opacity="0.7">{ch["header_right"]}</text>'''
+
+
+def _chrome_footer(ch, PAGE_W, PAGE_H, FOOTER_H, fcs, DARK, ACCENT, MID, SERIF):
+    """The branded bottom band: unit name (serif), accent rule, unit size, address,
+    optional key-plan mini-plate, and the fine-print line. Shared (see _chrome_header)."""
+    return f'''  <rect y="{PAGE_H-FOOTER_H}" width="{PAGE_W}" height="{FOOTER_H}" fill="{DARK}"/>
+  <text x="60" y="{PAGE_H-FOOTER_H+round(68*fcs)}" font-family="{SERIF}" font-size="{round(44*fcs)}" fill="#FFFFFF">{ch["title"]}</text>
+  <line x1="62" y1="{PAGE_H-FOOTER_H+round(86*fcs)}" x2="{round(62+60*fcs)}" y2="{PAGE_H-FOOTER_H+round(86*fcs)}" stroke="{ACCENT}" stroke-width="2.5"/>
+  <text x="60" y="{PAGE_H-FOOTER_H+round(113*fcs)}" font-size="{round(13*fcs)}" letter-spacing="3" fill="{MID}">{ch["sub_line"]}</text>
+  <text x="60" y="{PAGE_H-FOOTER_H+round(145*fcs)}" font-size="{round(13*fcs)}" letter-spacing="2.5" fill="{ACCENT}">{ch["footer_addr"]}</text>
+  {ch["footer_kp_svg"]}
+  {ch["floor_label_svg"]}'''
+
+
 def render(prims, config):
+    PAGE_W, PAGE_H, HEADER_H, FOOTER_H, fcs, PLAN_MAX_W, PLAN_MAX_H = _page_dims(config)
     palette = {**DEFAULT_PALETTE, **(config.get("palette") or {})}
     # Palette colours are user-supplied (property setup / render override) and
     # interpolated into many fill=/stroke= attributes — validate them as #hex so a
@@ -649,7 +724,7 @@ def render(prims, config):
         if (config.get("synthesize_poche", True) and not wall_fills
                 and (wall_lines or cavity_lines)):
             poche_img = _wall_poche_image(wall_lines, cavity_lines, plan_w, plan_h,
-                                          WALL, config.get("poche_close_px"))
+                                          WALL, PAGE_W, PAGE_H, config.get("poche_close_px"))
         if poche_img:
             # The cavity faces are now part of the solid band — stroke them in
             # wall ink too so every band edge stays crisp vector (the soft raster
@@ -712,32 +787,29 @@ def render(prims, config):
         png_bytes = render_png(bare, out_w)
         # legacy: png_bytes = cairosvg.svg2png(bytestring=bare.encode("utf-8"), output_width=out_w)
         meta = {
-            "transform": {"tx": round(tx, 4), "ty": round(ty, 4), "s": round(s, 6)},
+            "transform": {"tx": round(tx, 4), "ty": round(ty, 4), "s": float(f"{s:.9g}")},
             "page": {"w": round(vbw, 1), "h": round(vbh, 1)},
             "extents": {"minx": dminx, "maxx": dmaxx, "miny": dminy, "maxy": dmaxy},
             "placements": placements,
             "plan_only": True,
+            "png_w": out_w,      # actual raster width, so a font re-render matches exactly
         }
         return bare, png_bytes, meta
 
     ch = _brand_chrome(config, palette, DARK, ACCENT, MID, LIGHT, SERIF, SERIF_NAME, SANS,
-                       plan_top, plan_h)
+                       plan_top, plan_h, PAGE_W, PAGE_H, HEADER_H, FOOTER_H, fcs)
     title, sub_line = ch["title"], ch["sub_line"]
     prop_name, location = ch["prop_name"], ch["location"]
     lockup_svg, header_right = ch["lockup_svg"], ch["header_right"]
-    footer_addr, disclaimer = ch["footer_addr"], ch["disclaimer"]
+    footer_addr = ch["footer_addr"]
     divider_x, name_x = ch["divider_x"], ch["name_x"]
-    footer_kp_svg, floor_label_svg, addr_x = ch["footer_kp_svg"], ch["floor_label_svg"], ch["addr_x"]
+    footer_kp_svg, floor_label_svg = ch["footer_kp_svg"], ch["floor_label_svg"]
     sold_out_svg, watermark_svg, wm_in_doc = ch["sold_out_svg"], ch["watermark_svg"], ch["wm_in_doc"]
 
+    hpad = (HEADER_H - 92 * fcs) / 2.0   # header content re-centre (see _brand_chrome)
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {PAGE_W} {PAGE_H}" font-family="{SANS}">
   <rect width="{PAGE_W}" height="{PAGE_H}" fill="{LIGHT}"/>
-  <rect width="{PAGE_W}" height="{HEADER_H}" fill="{DARK}"/>
-  {lockup_svg}
-  <line x1="{divider_x:.0f}" y1="24" x2="{divider_x:.0f}" y2="68" stroke="{ACCENT}" stroke-width="1.2" stroke-opacity="0.7"/>
-  <text x="{name_x:.0f}" y="50" font-size="21" letter-spacing="7" fill="#FFFFFF">{prop_name}</text>
-  <text x="{name_x:.0f}" y="71" font-size="11" letter-spacing="4" fill="{MID}" fill-opacity="0.85">{location}</text>
-  <text x="{PAGE_W-60}" y="56" text-anchor="end" font-size="11" letter-spacing="3.5" fill="{MID}" fill-opacity="0.7">{header_right}</text>
+{_chrome_header(ch, PAGE_W, HEADER_H, fcs, DARK, ACCENT, MID, SERIF)}
   {poche_img or ''}
   <g stroke-linecap="round" stroke-linejoin="round" fill="none">
     <path d="{' '.join(wall_fills)}" fill="{WALL}" stroke="none" fill-rule="nonzero"/>
@@ -752,21 +824,19 @@ def render(prims, config):
   {paint_layer_svg}
   {wm_in_doc}
   {sold_out_svg}
-  <rect y="{PAGE_H-FOOTER_H}" width="{PAGE_W}" height="{FOOTER_H}" fill="{DARK}"/>
-  <text x="60" y="{PAGE_H-FOOTER_H+62}" font-family="{SERIF}" font-size="40" fill="#FFFFFF">{title}</text>
-  <line x1="62" y1="{PAGE_H-FOOTER_H+80}" x2="122" y2="{PAGE_H-FOOTER_H+80}" stroke="{ACCENT}" stroke-width="2.5"/>
-  <text x="60" y="{PAGE_H-FOOTER_H+106}" font-size="12.5" letter-spacing="3" fill="{MID}">{sub_line}</text>
-  <text x="{addr_x:.0f}" y="{PAGE_H-FOOTER_H+62}" text-anchor="end" font-size="12" letter-spacing="2.5" fill="{ACCENT}">{footer_addr}</text>
-  <text x="{addr_x:.0f}" y="{PAGE_H-FOOTER_H+104}" text-anchor="end" font-size="8.5" letter-spacing="1" fill="{MID}" fill-opacity="0.45">{disclaimer}</text>
-  {footer_kp_svg}
-  {floor_label_svg}
+{_chrome_footer(ch, PAGE_W, PAGE_H, FOOTER_H, fcs, DARK, ACCENT, MID, SERIF)}
 </svg>'''
 
-    png_bytes = render_png(svg, SHEET_PNG_W)
+    # The 2000px resvg raster is the dominant per-call cost. A live preview only
+    # consumes the SVG and throws the PNG away, so the caller sets want_png=False
+    # to skip it; save/export/download leave it default-True. The SVG (the
+    # authoritative artifact) is byte-for-byte identical either way.
+    png_bytes = render_png(svg, SHEET_PNG_W) if config.get("want_png", True) else None
     # legacy: png_bytes = cairosvg.svg2png(bytestring=svg.encode("utf-8"), output_width=SHEET_PNG_W)
     meta = {
-        "transform": {"tx": round(tx, 4), "ty": round(ty, 4), "s": round(s, 6)},
+        "transform": {"tx": round(tx, 4), "ty": round(ty, 4), "s": float(f"{s:.9g}")},
         "page": {"w": PAGE_W, "h": PAGE_H},
+        "png_w": SHEET_PNG_W,
         "extents": {"minx": minx, "maxx": maxx, "miny": miny, "maxy": maxy},
         "placements": placements,
         # Ghost watermark markup, so the editor can lay it above the paint canvas
@@ -792,6 +862,7 @@ def render_image_plan(image_bytes, config):
     SANS_NAME = fonts.get("sans", DEFAULT_SANS)
     SERIF = _font_stack(SERIF_NAME, "serif")
     SANS = _font_stack(SANS_NAME, "sans-serif")
+    PAGE_W, PAGE_H, HEADER_H, FOOTER_H, fcs, PLAN_MAX_W, PLAN_MAX_H = _page_dims(config)
 
     iw, ih = img_size(image_bytes)
     s = min(PLAN_MAX_W / max(iw, 1), PLAN_MAX_H / max(ih, 1))
@@ -816,48 +887,85 @@ def render_image_plan(image_bytes, config):
             f'{paint_layer_svg}\n</svg>'
         )
         out_w = min(2400, max(1000, iw))
-        png_bytes = render_png(bare, out_w)
-        meta = {"page": {"w": iw, "h": ih}, "plan_only": True}
+        png_bytes = render_png(bare, out_w) if config.get("want_png", True) else None
+        # png_w carries the ACTUAL raster width (no ×2, unlike the DXF plan_only
+        # path) so a brand-font re-render matches instead of doubling resolution.
+        meta = {"page": {"w": iw, "h": ih}, "plan_only": True, "png_w": out_w}
         return bare, png_bytes, meta
 
     ch = _brand_chrome(config, palette, DARK, ACCENT, MID, LIGHT, SERIF, SERIF_NAME, SANS,
-                       plan_top, plan_h)
+                       plan_top, plan_h, PAGE_W, PAGE_H, HEADER_H, FOOTER_H, fcs)
     title, sub_line = ch["title"], ch["sub_line"]
     prop_name, location = ch["prop_name"], ch["location"]
     lockup_svg, header_right = ch["lockup_svg"], ch["header_right"]
-    footer_addr, disclaimer = ch["footer_addr"], ch["disclaimer"]
+    footer_addr = ch["footer_addr"]
     divider_x, name_x = ch["divider_x"], ch["name_x"]
-    footer_kp_svg, floor_label_svg, addr_x = ch["footer_kp_svg"], ch["floor_label_svg"], ch["addr_x"]
+    footer_kp_svg, floor_label_svg = ch["footer_kp_svg"], ch["floor_label_svg"]
     sold_out_svg, watermark_svg, wm_in_doc = ch["sold_out_svg"], ch["watermark_svg"], ch["wm_in_doc"]
 
+    # A live preview references the plan raster by URL (config["planimg_href"])
+    # instead of inlining base64; a save/export leaves it None to stay self-contained.
     plan_group = keyplan_group(image_bytes, plan_left, plan_top, plan_w, plan_h,
-                               palette, with_border=False)
+                               palette, with_border=False,
+                               img_href=config.get("planimg_href"))
 
+    hpad = (HEADER_H - 92 * fcs) / 2.0   # header content re-centre (see _brand_chrome)
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {PAGE_W} {PAGE_H}" font-family="{SANS}">
   <rect width="{PAGE_W}" height="{PAGE_H}" fill="{LIGHT}"/>
-  <rect width="{PAGE_W}" height="{HEADER_H}" fill="{DARK}"/>
-  {lockup_svg}
-  <line x1="{divider_x:.0f}" y1="24" x2="{divider_x:.0f}" y2="68" stroke="{ACCENT}" stroke-width="1.2" stroke-opacity="0.7"/>
-  <text x="{name_x:.0f}" y="50" font-size="21" letter-spacing="7" fill="#FFFFFF">{prop_name}</text>
-  <text x="{name_x:.0f}" y="71" font-size="11" letter-spacing="4" fill="{MID}" fill-opacity="0.85">{location}</text>
-  <text x="{PAGE_W-60}" y="56" text-anchor="end" font-size="11" letter-spacing="3.5" fill="{MID}" fill-opacity="0.7">{header_right}</text>
+{_chrome_header(ch, PAGE_W, HEADER_H, fcs, DARK, ACCENT, MID, SERIF)}
   {plan_group}
   {paint_layer_svg}
   {wm_in_doc}
   {sold_out_svg}
-  <rect y="{PAGE_H-FOOTER_H}" width="{PAGE_W}" height="{FOOTER_H}" fill="{DARK}"/>
-  <text x="60" y="{PAGE_H-FOOTER_H+62}" font-family="{SERIF}" font-size="40" fill="#FFFFFF">{title}</text>
-  <line x1="62" y1="{PAGE_H-FOOTER_H+80}" x2="122" y2="{PAGE_H-FOOTER_H+80}" stroke="{ACCENT}" stroke-width="2.5"/>
-  <text x="60" y="{PAGE_H-FOOTER_H+106}" font-size="12.5" letter-spacing="3" fill="{MID}">{sub_line}</text>
-  <text x="{addr_x:.0f}" y="{PAGE_H-FOOTER_H+62}" text-anchor="end" font-size="12" letter-spacing="2.5" fill="{ACCENT}">{footer_addr}</text>
-  <text x="{addr_x:.0f}" y="{PAGE_H-FOOTER_H+104}" text-anchor="end" font-size="8.5" letter-spacing="1" fill="{MID}" fill-opacity="0.45">{disclaimer}</text>
-  {footer_kp_svg}
-  {floor_label_svg}
+{_chrome_footer(ch, PAGE_W, PAGE_H, FOOTER_H, fcs, DARK, ACCENT, MID, SERIF)}
 </svg>'''
 
-    png_bytes = render_png(svg, SHEET_PNG_W)
+    png_bytes = render_png(svg, SHEET_PNG_W) if config.get("want_png", True) else None
     meta = {
         "page": {"w": PAGE_W, "h": PAGE_H},
+        "png_w": SHEET_PNG_W,
         "watermark_svg": watermark_svg,
     }
     return svg, png_bytes, meta
+
+
+def render_keyplan_sheet(config):
+    """Standalone branded key-plan page. Uses the SAME header/footer chrome as the
+    floor-plan sheets (_brand_chrome + _chrome_header/_chrome_footer), with the
+    key-plan plate centred as the body and marked NOT TO SCALE — so it can't drift
+    from the main sheets the way the old duplicated copy in keyplan.py did."""
+    kp = config.get("keyplan") or {}
+    plate = kp.get("plate_bytes")
+    if not plate:
+        raise ValueError("No plate image provided for the key plan.")
+    PAGE_W, PAGE_H, HEADER_H, FOOTER_H, fcs, PLAN_MAX_W, PLAN_MAX_H = _page_dims(config)
+    palette = {**DEFAULT_PALETTE, **(config.get("palette") or {})}
+    DARK = _safe_color(palette["dark"], DEFAULT_PALETTE["dark"])
+    ACCENT = _safe_color(palette["accent"], DEFAULT_PALETTE["accent"])
+    MID = _safe_color(palette["mid"], DEFAULT_PALETTE["mid"])
+    LIGHT = _safe_color(palette["light"], DEFAULT_PALETTE["light"])
+    fonts = config.get("fonts") or {}
+    SERIF_NAME = fonts.get("serif", DEFAULT_SERIF)
+    SERIF = _font_stack(SERIF_NAME, "serif")
+    SANS = _font_stack(fonts.get("sans", DEFAULT_SANS), "sans-serif")
+
+    iw, ih = img_size(plate)
+    s = min(PLAN_MAX_W / max(iw, 1), PLAN_MAX_H / max(ih, 1))
+    pw, ph = iw * s, ih * s
+    ox = (PAGE_W - pw) / 2
+    oy = HEADER_H + (PAGE_H - HEADER_H - FOOTER_H - ph) / 2
+    group = keyplan_group(plate, ox, oy, pw, ph, palette, box=kp.get("box"))
+
+    ch = _brand_chrome(config, palette, DARK, ACCENT, MID, LIGHT, SERIF, SERIF_NAME, SANS,
+                       oy, ph, PAGE_W, PAGE_H, HEADER_H, FOOTER_H, fcs)
+    ch["header_right"] = "KEY PLAN"     # this page's top-right label
+    floor_label = html.escape((kp.get("floor_label") or "").upper())
+
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {PAGE_W} {PAGE_H}" font-family="{SANS}">
+  <rect width="{PAGE_W}" height="{PAGE_H}" fill="{LIGHT}"/>
+{_chrome_header(ch, PAGE_W, HEADER_H, fcs, DARK, ACCENT, MID, SERIF)}
+  {group}
+  <text x="{PAGE_W/2:.0f}" y="{oy - 14:.0f}" text-anchor="middle" font-size="11" letter-spacing="3" fill="{DARK}" fill-opacity="0.6">{floor_label}</text>
+  <text x="{PAGE_W/2:.0f}" y="{oy + ph + 26:.0f}" text-anchor="middle" font-size="10" letter-spacing="2.5" fill="{DARK}" fill-opacity="0.5">SCHEMATIC KEY PLAN — NOT TO SCALE</text>
+{_chrome_footer(ch, PAGE_W, PAGE_H, FOOTER_H, fcs, DARK, ACCENT, MID, SERIF)}
+</svg>'''

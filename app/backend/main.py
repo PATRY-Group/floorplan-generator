@@ -21,6 +21,7 @@ State lives on disk under data/. The uploads cache is swept automatically.
 
 import base64
 # import glob      # now via storage.glob (filesystem or Blob)
+import hashlib
 import io
 import json
 import logging
@@ -31,6 +32,8 @@ import threading
 import time
 import uuid
 import zipfile
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,8 +46,10 @@ from ezdxf.filemanagement import readfile
 from engine import (parse_dxf, ParseError, DEFAULT_LAYER_MAP, infer_layer_map,
                     render, render_image_plan, render_png, SHEET_PNG_W,
                     render_keyplan_sheet, autocrop_plate, pdf_to_png, PdfPlanError,
+                    rotate_plate, rotate_box,
                     dwg_to_dxf, converter_available,
                     ConversionError, extract_brand, BrandError)
+from engine.render import PAGE_W as _PAGE_W, PAGE_H as _PAGE_H
 import storage   # filesystem (local/Docker) or Vercel Blob, chosen by env token
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -64,16 +69,56 @@ storage.ROOT = DATA   # paths under DATA map to blob keys relative to this root
 MAX_UPLOAD_MB = 60
 UPLOAD_TTL_HOURS = 168  # working files in uploads/ older than this get swept (1 week)
 
+# Saved-sheet artifacts and plate images are content-stable for a given URL:
+# the library cache-busts them with ?v={updated} on every re-save (Library.jsx),
+# and a plate_id's cropped bytes never change. So they're safe to cache forever
+# — this makes the library grid instant on revisit instead of re-fetching MBs.
+IMMUTABLE_CACHE = "public, max-age=31536000, immutable"
+
+# Bounded in-process memo for repeated /render calls with identical inputs (e.g.
+# toggling a UI option back and forth, or re-opening the last-previewed state).
+# Keyed by geometry (doc_id — stable once parsed) + the full config that drives
+# the SVG. Preview/download only; saves are skipped (unique paint_image + disk
+# side effects). Lost on serverless cold start and capped — a latency win, never
+# a correctness dependency. Complements render.py's _POCHE_CACHE.
+_RENDER_CACHE: "OrderedDict[str, tuple]" = OrderedDict()
+_RENDER_CACHE_MAX = 32
+# FastAPI runs sync endpoints in a threadpool, so guard the OrderedDict: a
+# concurrent get/move_to_end racing an insert/popitem can KeyError (a 500).
+_RENDER_CACHE_LOCK = threading.Lock()
+
+# Client-supplied API base that gets interpolated into an SVG href — restrict it
+# to a URL-path charset so it can't break out of the attribute (XSS guard).
+_SAFE_BASE_RE = re.compile(r"^[A-Za-z0-9:/._-]{1,200}$")
+
+
+def _render_cache_key(doc_id, config):
+    """Stable hash of (doc_id, config). config may carry bytes (keyplan
+    plate_bytes) and other non-JSON values — hash bytes by content, everything
+    else by repr, so equal inputs collapse to the same key."""
+    blob = json.dumps(config, sort_keys=True, default=lambda o:
+                      hashlib.sha256(o).hexdigest() if isinstance(o, (bytes, bytearray))
+                      else repr(o))
+    return doc_id + ":" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
 logger = logging.getLogger(__name__)
 
 # Allowed CORS origins default to the local Vite dev server (which fronts this
 # API via its /api proxy). Override in deployment with the ALLOWED_ORIGINS env
-# var — a comma-separated list of origins (same pattern as UPLOAD_TTL_HOURS).
+# var — a comma-separated list of origins.
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
     "ALLOWED_ORIGINS",
     "http://localhost:5173,http://127.0.0.1:5173").split(",") if o.strip()]
 
-app = FastAPI(title="Floor Plan Sheet Generator")
+@asynccontextmanager
+async def _lifespan(app):
+    # Sweep stale uploads on boot (sweep_uploads is defined below; resolved at
+    # call time). Replaces the deprecated @app.on_event("startup") hook.
+    sweep_uploads()
+    yield
+
+
+app = FastAPI(title="Floor Plan Sheet Generator", lifespan=_lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
                    allow_methods=["*"], allow_headers=["*"])
 
@@ -259,34 +304,59 @@ def _thumb_png(png_bytes, width=THUMB_W):
         return png_bytes
 
 
+# The sheet page is US Letter portrait proportions (see engine.render PAGE_W:PAGE_H
+# = 1000:1294), so wrapping it at 8.5in wide yields a true 8.5x11in page. The PDF is
+# a raster wrap of the already-correct branded PNG: guaranteed to match the PNG
+# export (same fonts/watermark/paint), and no vector-SVG renderer to re-drop text on
+# the fontless serverless host. See engine/render.py's resvg notes.
+PDF_PAGE_WIDTH_IN = 8.5   # US Letter width; height follows the Letter-proportioned sheet -> 11in
+
+
+def _png_to_pdf(png_bytes):
+    """Wrap a sheet PNG in a one-page PDF whose page matches the sheet's own aspect
+    (PDF_PAGE_WIDTH_IN inches wide), so it fills the page with no bands. resvg
+    emits RGBA; flatten onto white first (Pillow's PDF encoder can't write alpha
+    and would otherwise error or garble)."""
+    from PIL import Image
+    im = Image.open(io.BytesIO(png_bytes))
+    if im.mode == "RGBA":
+        bg = Image.new("RGB", im.size, (255, 255, 255))
+        bg.paste(im, mask=im.split()[3])
+        im = bg
+    elif im.mode != "RGB":
+        im = im.convert("RGB")
+    # Landscape sheets (wider than tall) map to 11x8.5in; portrait to 8.5x11 — both
+    # true US Letter, just rotated. Keyed off the rendered image's aspect.
+    width_in = 11.0 if im.width > im.height else PDF_PAGE_WIDTH_IN
+    dpi = max(1.0, im.width / width_in)
+    buf = io.BytesIO()
+    im.save(buf, format="PDF", resolution=dpi)
+    return buf.getvalue()
+
+
 def _png_width(meta):
-    """Match the resvg re-render width to whatever the cairosvg path used: the
-    default sheet is SHEET_PNG_W, but the plan_only export renders wider (see
-    engine.render), so derive it from meta to keep branded/unbranded PNGs equal."""
+    """Match the resvg re-render width to the engine's own PNG width so a
+    branded (font) re-render comes out the same size as the unbranded one. The
+    engine reports its actual raster width as meta["png_w"]; fall back to the old
+    derivation for any meta that predates it."""
+    w = meta.get("png_w")
+    if w:
+        return w
     return (min(2400, max(1000, round(meta["page"]["w"] * 2)))
             if meta.get("plan_only") else SHEET_PNG_W)
 
 
-def _apply_custom_fonts(svg, png, font_faces, png_width=SHEET_PNG_W):
-    """Make uploaded brand fonts render everywhere. cairosvg ignores embedded
-    fonts, so when a property carries font faces we (1) inline an @font-face so
-    the SVG renders the font in any browser, and (2) re-render the PNG with
-    resvg, which honours fonts loaded from files. Falls back to the cairosvg PNG
-    if resvg is unavailable — the SVG still carries the font either way.
-
-    png_width is the raster pixel width the cairosvg path used (engine.render's
-    output_width), threaded in by the caller so the resvg re-render comes out at
-    the same resolution — otherwise a branded PNG would differ in size from an
-    unbranded one (notably the plan_only export, which renders wider than the
-    default 900px sheet)."""
+def _raster_with_faces(svg, png_width, font_faces):
+    """resvg-raster `svg` at `png_width`, loading any uploaded brand fonts from
+    temp files — resvg only honours fonts from *files*, so the @font-face data
+    URI already inlined in the SVG (for browsers) isn't enough for the PNG. With
+    no brand faces (or on error) it renders with the bundled fallback fonts that
+    render_png always supplies. Shared by the inline save path and the lazy
+    rebuild so both produce the identical PNG."""
     faces = [f for f in (font_faces or [])
              if f.get("family") and _FONT_DATA_RE.match((f.get("data") or "").strip())]
     if not faces:
-        return svg, png
-    style = "<style>" + "".join(
-        "@font-face{font-family:'%s';src:url(%s);}" % (_css_family(f["family"]), f["data"])
-        for f in faces) + "</style>"
-    svg2 = svg.replace(">", ">" + style, 1)   # inject right after the <svg …> tag
+        return render_png(svg, png_width)
     tmp = []
     try:
         import tempfile
@@ -300,16 +370,64 @@ def _apply_custom_fonts(svg, png, font_faces, png_width=SHEET_PNG_W):
         # uploaded brand faces take precedence; render_png appends the bundled
         # Arimo/Gelasio fallbacks so any text the brand font doesn't cover (and the
         # generic serif/sans stacks) still render on a no-system-font host.
-        png2 = render_png(svg2, png_width, extra_font_files=tmp)
-        return svg2, png2
+        return render_png(svg, png_width, extra_font_files=tmp)
     except Exception:
-        return svg2, png
+        return render_png(svg, png_width)   # brand faces unusable — fallback fonts
     finally:
         for p in tmp:
             try:
                 os.remove(p)
             except OSError:
                 pass
+
+
+def _apply_custom_fonts(svg, png, font_faces, png_width=SHEET_PNG_W):
+    """Make uploaded brand fonts render everywhere. When a property carries font
+    faces we (1) inline an @font-face so the SVG renders the font in any browser,
+    and (2) re-render the PNG with resvg, which honours fonts loaded from files.
+    Falls back to the engine's original PNG if the resvg re-render fails — the
+    SVG still carries the font either way.
+
+    png_width is the raster pixel width the engine rendered at (engine.render's
+    output_width), threaded in by the caller so the resvg re-render comes out at
+    the same resolution — otherwise a branded PNG would differ in size from an
+    unbranded one (notably the plan_only export, which renders wider than the
+    default 900px sheet)."""
+    faces = [f for f in (font_faces or [])
+             if f.get("family") and _FONT_DATA_RE.match((f.get("data") or "").strip())]
+    if not faces:
+        return svg, png
+    style = "<style>" + "".join(
+        "@font-face{font-family:'%s';src:url(%s);}" % (_css_family(f["family"]), f["data"])
+        for f in faces) + "</style>"
+    svg2 = svg.replace(">", ">" + style, 1)   # inject right after the <svg …> tag
+    # A live preview skips the PNG (png is None): the inlined @font-face above is
+    # all the on-screen SVG needs, so there's no raster to redo — return early
+    # and don't pay for the resvg second pass.
+    if png is None:
+        return svg2, None
+    return svg2, _raster_with_faces(svg2, png_width, faces)
+
+
+def _sheet_png_bytes(prop_id, sheet_id):
+    """The full-resolution sheet PNG, rasterized on demand. A save defers the
+    raster (it persists only the SVG — the authoritative artifact), so the PNG is
+    built here from the saved SVG on first access and cached back to disk. This is
+    byte-identical to the inline save path: the saved SVG *is* the font-injected
+    `svg2`, and we re-raster it with the same brand fonts (loaded from the
+    property) at the same SHEET_PNG_W. Saved sheets are never plan_only, so the
+    width is always SHEET_PNG_W. Returns None only if the sheet has no SVG."""
+    d = os.path.join(SHEET_DIR, prop_id)
+    png = storage.read_bytes(os.path.join(d, f"{sheet_id}.png"))
+    if png is not None:
+        return png
+    svg = storage.read_text(os.path.join(d, f"{sheet_id}.svg"))
+    if not svg:
+        return None
+    prop = load_property(prop_id)
+    png = _raster_with_faces(svg, SHEET_PNG_W, (prop or {}).get("font_faces"))
+    storage.write_bytes(os.path.join(d, f"{sheet_id}.png"), png)   # cache for next fetch
+    return png
 
 
 @app.post("/font-info")
@@ -490,8 +608,23 @@ def get_plate(plate_id: str):
                      os.path.splitext(fn)[1].lower(), "image/png")
         data = storage.read_bytes(fn)
         if data is not None:
-            return Response(content=data, media_type=media)
+            return Response(content=data, media_type=media,
+                            headers={"Cache-Control": IMMUTABLE_CACHE})
     raise HTTPException(status_code=404, detail="Plate not found or expired.")
+
+
+@app.get("/planimg/{doc_id}")
+def get_planimg(doc_id: str):
+    """Serve the cropped floor-plan raster for an image/PDF plan. Live previews
+    reference the plan by this URL instead of re-embedding a multi-MB base64
+    blob in every render's SVG (the saved sheet still inlines it, so it stays
+    self-contained). Content is stable per doc_id, so cache it hard."""
+    _safe_id(doc_id, "doc id")
+    data = _load_planimg(doc_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Plan image not found or expired.")
+    return Response(content=data, media_type="image/png",
+                    headers={"Cache-Control": IMMUTABLE_CACHE})
 
 
 # --------------------------------------------------------------------------- #
@@ -499,20 +632,27 @@ def get_plate(plate_id: str):
 # --------------------------------------------------------------------------- #
 @app.post("/plan-pdf")
 async def upload_plan_pdf(file: UploadFile = File(...)):
-    """Intake for a PDF of an already-finished floor plan: rasterize its single
-    page, autocrop it, and mint a doc_id the same way /parse does — so /render
-    can treat it uniformly with a DXF-sourced doc from here on (see _load_doc)."""
+    """Intake for an already-finished floor plan supplied as a PDF **or a raster
+    image (PNG/JPG)**: rasterize the PDF's single page (images are used as-is),
+    autocrop, and mint a doc_id the same way /parse does — so /render treats it
+    uniformly with a DXF-sourced doc from here on (see _load_doc)."""
     sweep_uploads()
     name = (file.filename or "").lower()
-    raw = await _read_capped(file, 25 * 1024 * 1024, "PDF too large (max 25 MB).")
+    raw = await _read_capped(file, 25 * 1024 * 1024, "File too large (max 25 MB).")
     # Extension-trust only, matching /parse's convention — bad content behind a
-    # correct extension surfaces as a 422 from pdf_to_png below, not here.
-    if not name.endswith(".pdf"):
-        raise HTTPException(status_code=415, detail="Upload a PDF of the floor plan.")
-    try:
-        png = pdf_to_png(raw)
-    except PdfPlanError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+    # correct extension surfaces as a 422 here (pdf_to_png / _verify_raster), not
+    # at the extension gate (415).
+    if name.endswith(".pdf"):
+        try:
+            png = pdf_to_png(raw)
+        except PdfPlanError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+    elif name.endswith((".png", ".jpg", ".jpeg")):
+        _verify_raster(raw)     # autocrop can't reject junk, so validate here
+        png = raw
+    else:
+        raise HTTPException(status_code=415,
+                            detail="Upload a PDF, PNG, or JPG of the floor plan.")
     cropped = autocrop_plate(png)
     doc_id = uuid.uuid4().hex[:12]
     storage.write_bytes(os.path.join(UP_DIR, f"{doc_id}.planimg.png"), cropped)
@@ -551,9 +691,12 @@ class RenderRequest(BaseModel):
     save: bool = False
     sheet_id: Optional[str] = None   # overwrite this saved sheet instead of minting a new one
     want_png: bool = False   # include base64 PNG in the response (for download)
+    want_pdf: bool = False   # include base64 single-page PDF (wraps the PNG; for download)
     plan_only: bool = False  # bare line drawing — no header/footer/watermark/keyplan
     paint_image: Optional[str] = None  # PNG data-URI of the manual paint layer, baked into exports only
     live_preview: bool = False  # editor preview: omit the watermark from the SVG (the frontend overlays it above the paint canvas) — exports bake it inline
+    asset_base: str = ""  # client's API base (e.g. "/api"); lets a live image-plan preview reference /planimg/{doc_id} by URL instead of inlining the raster
+    orientation: str = "portrait"  # "portrait" (8.5x11) or "landscape" (11x8.5); swaps the page W/H
 
 
 def _load_prims(doc_id):
@@ -587,22 +730,73 @@ def do_render(req: RenderRequest):
     config["plan_only"] = req.plan_only
     config["paint_image"] = req.paint_image
     config["live_preview"] = req.live_preview
+    # Orientation may arrive top-level (RenderRequest.orientation) or ride in the
+    # metadata (the frontend stores it there so it persists + autosaves with the sheet).
+    _orient = req.orientation if req.orientation == "landscape" else (req.metadata or {}).get("orientation")
+    config["orientation"] = "landscape" if _orient == "landscape" else "portrait"
+    # The PNG is only needed when the client asks for it (download) or on save
+    # (persisted to disk). A live preview uses only the SVG, so skip the 2000px
+    # resvg raster (and its brand-font second pass) entirely — the big win here.
+    # Rasterize the PNG inline only when the client needs it in the response
+    # (download of a PNG/PDF). A save no longer forces it: the response returns as
+    # soon as the SVG + metadata are persisted, and the PNG/thumbnail are built
+    # lazily from the saved SVG on first fetch (_sheet_png_bytes) — byte-identical,
+    # but the save round-trip no longer pays for a 2000px resvg raster.
+    config["want_png"] = bool(req.want_png or req.want_pdf)
+    # Image/PDF plans: on a live preview, point the SVG's <image> at /planimg
+    # instead of inlining a multi-MB base64 raster on every keystroke. Saves
+    # (self-contained artifacts) and downloads keep the inline embed. asset_base
+    # is client-supplied and lands in an href="…" attribute of an inlined SVG, so
+    # it must be charset-restricted to prevent breaking out of the attribute.
+    if (image_bytes is not None and req.live_preview and not req.save
+            and req.asset_base and _SAFE_BASE_RE.match(req.asset_base)):
+        config["planimg_href"] = f"{req.asset_base.rstrip('/')}/planimg/{req.doc_id}"
     if req.keyplan and not req.plan_only:
         kp = dict(req.keyplan)
-        kp["plate_bytes"] = _plate_bytes(kp.get("plate_id"))
+        plate = _plate_bytes(kp.get("plate_id"))
+        # Optional user rotation of the key-plan image (0/90/180/270 CW). Rotate the
+        # raster AND the highlight box together so the marked cell stays put.
+        # This runs before the render try/except, so a junk value must not 500.
+        try:
+            rot = int(kp.get("rotate") or 0) % 360
+        except (TypeError, ValueError):
+            rot = 0
+        if plate and rot:
+            plate = rotate_plate(plate, rot)
+            if kp.get("box"):
+                kp["box"] = rotate_box(kp["box"], rot)
+        kp["plate_bytes"] = plate
         config["keyplan"] = kp
-    try:
-        svg, png, meta = (render(prims, config) if prims is not None
-                          else render_image_plan(image_bytes, config))
-    except (ParseError, ValueError, KeyError) as exc:
-        # Bad input / config (unknown palette key, malformed geometry, …) —
-        # meaningful to the user, so surface it as a 422 with the real message.
-        raise HTTPException(status_code=422, detail=str(exc))
-    except Exception:
-        # Genuinely unexpected server fault: log the full traceback for ops and
-        # return a generic message rather than leaking internals to the client.
-        logger.exception("Unexpected error rendering doc_id=%s", req.doc_id)
-        raise HTTPException(status_code=500, detail="Render failed — see server logs")
+    # Serve an identical prior preview from the memo; saves bypass it (side
+    # effects + a unique paint_image would never hit anyway).
+    cache_key = None if req.save else _render_cache_key(req.doc_id, config)
+    if cache_key:
+        with _RENDER_CACHE_LOCK:
+            cached = _RENDER_CACHE.get(cache_key)
+            if cached is not None:
+                _RENDER_CACHE.move_to_end(cache_key)
+    else:
+        cached = None
+    if cached is not None:
+        svg, png, meta = cached
+    else:
+        try:
+            svg, png, meta = (render(prims, config) if prims is not None
+                              else render_image_plan(image_bytes, config))
+        except (ParseError, ValueError, KeyError) as exc:
+            # Bad input / config (unknown palette key, malformed geometry, …) —
+            # meaningful to the user, so surface it as a 422 with the real message.
+            raise HTTPException(status_code=422, detail=str(exc))
+        except Exception:
+            # Genuinely unexpected server fault: log the full traceback for ops and
+            # return a generic message rather than leaking internals to the client.
+            logger.exception("Unexpected error rendering doc_id=%s", req.doc_id)
+            raise HTTPException(status_code=500, detail="Render failed — see server logs")
+        if cache_key:
+            with _RENDER_CACHE_LOCK:
+                _RENDER_CACHE[cache_key] = (svg, png, meta)
+                if len(_RENDER_CACHE) > _RENDER_CACHE_MAX:
+                    _RENDER_CACHE.popitem(last=False)   # evict least-recently-used
     # Embed any uploaded brand fonts so they render in both the SVG and the PNG.
     svg, png = _apply_custom_fonts(svg, png, config.get("font_faces"), png_width=_png_width(meta))
 
@@ -610,6 +804,10 @@ def do_render(req: RenderRequest):
     if req.keyplan and not req.plan_only and req.keyplan.get("placement") == "standalone":
         try:
             keyplan_svg = render_keyplan_sheet(config)
+            # Thread brand fonts into the standalone key plan too, or the saved
+            # {sheet_id}-keyplan.svg renders in fallback fonts while the main
+            # sheet uses the brand faces.
+            keyplan_svg, _ = _apply_custom_fonts(keyplan_svg, None, config.get("font_faces"))
         except (ParseError, ValueError, KeyError) as exc:
             raise HTTPException(status_code=422, detail=str(exc))
         except Exception:
@@ -629,10 +827,19 @@ def do_render(req: RenderRequest):
         sheet_id = req.sheet_id if existing else uuid.uuid4().hex[:10]
 
         storage.write_text(os.path.join(out, f"{sheet_id}.svg"), svg)
-        storage.write_bytes(os.path.join(out, f"{sheet_id}.png"), png)
-        # Pre-build the library thumbnail so the grid never pays to fetch the full
-        # sheet. Overwriting on re-save keeps it in step with the PNG above.
-        storage.write_bytes(os.path.join(out, f"{sheet_id}.thumb.png"), _thumb_png(png))
+        # The PNG/thumbnail are derived, re-buildable artifacts. A plain save
+        # defers them (png is None) — they're rasterized from this SVG on first
+        # fetch. A save that also requested a PNG/PDF already has it, so persist
+        # it (and its thumbnail) now to save the rebuild. On re-save, drop a stale
+        # cached PNG/thumb so the next fetch rebuilds from the new SVG.
+        png_path = os.path.join(out, f"{sheet_id}.png")
+        thumb_path = os.path.join(out, f"{sheet_id}.thumb.png")
+        if png is not None:
+            storage.write_bytes(png_path, png)
+            storage.write_bytes(thumb_path, _thumb_png(png))
+        else:
+            storage.remove(png_path)     # no-op if absent; prevents serving a stale raster
+            storage.remove(thumb_path)
         kp_path = os.path.join(out, f"{sheet_id}-keyplan.svg")
         if keyplan_svg:
             storage.write_text(kp_path, keyplan_svg)
@@ -682,8 +889,10 @@ def do_render(req: RenderRequest):
             _write_json(index, sheets, indent=2, ensure_ascii=False)
 
     png_b64 = base64.b64encode(png).decode("ascii") if req.want_png else None
+    pdf_b64 = (base64.b64encode(_png_to_pdf(png)).decode("ascii")
+               if req.want_pdf and png else None)
     return {"svg": svg, "keyplan_svg": keyplan_svg, "sheet_id": sheet_id,
-            "meta": meta, "png_b64": png_b64}
+            "meta": meta, "png_b64": png_b64, "pdf_b64": pdf_b64}
 
 
 # --------------------------------------------------------------------------- #
@@ -825,8 +1034,8 @@ def get_sheet_svg(prop_id, sheet_id):
     # Allows inline styles + data: images so the sheet itself still renders; when
     # embedded via <img> (the library), scripts can't run regardless.
     return Response(text, media_type="image/svg+xml", headers={
-        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src data:",
-        "X-Content-Type-Options": "nosniff"})
+        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:",
+        "X-Content-Type-Options": "nosniff", "Cache-Control": IMMUTABLE_CACHE})
 
 
 @app.get("/sheets/{prop_id}/{sheet_id}.thumb.png")
@@ -834,29 +1043,47 @@ def get_sheet_thumb(prop_id, sheet_id):
     """Small thumbnail for the library grid. MUST be declared before the .png
     route: `{sheet_id}.png` also matches `<id>.thumb.png` (capturing
     sheet_id="<id>.thumb", which then 400s on _safe_id's no-dot rule), and
-    Starlette resolves routes in declaration order. Saves pre-build the thumb;
-    legacy sheets get it lazily from the full PNG, cached back for next time."""
+    Starlette resolves routes in declaration order. Saves that produced a PNG
+    pre-build the thumb; otherwise it's built lazily from the full PNG (itself
+    rebuilt from the SVG on demand), cached back for next time."""
     _safe_id(prop_id, "property id")
     _safe_id(sheet_id, "sheet id")
     d = os.path.join(SHEET_DIR, prop_id)
     data = storage.read_bytes(os.path.join(d, f"{sheet_id}.thumb.png"))
     if data is None:
-        full = storage.read_bytes(os.path.join(d, f"{sheet_id}.png"))
+        full = _sheet_png_bytes(prop_id, sheet_id)   # rebuilds from SVG if the PNG was deferred
         if full is None:
             raise HTTPException(status_code=404, detail="Sheet not found.")
         data = _thumb_png(full)
         storage.write_bytes(os.path.join(d, f"{sheet_id}.thumb.png"), data)
-    return Response(data, media_type="image/png")
+    return Response(data, media_type="image/png",
+                    headers={"Cache-Control": IMMUTABLE_CACHE})
 
 
 @app.get("/sheets/{prop_id}/{sheet_id}.png")
 def get_sheet_png(prop_id, sheet_id):
     _safe_id(prop_id, "property id")
     _safe_id(sheet_id, "sheet id")
-    data = storage.read_bytes(os.path.join(SHEET_DIR, prop_id, f"{sheet_id}.png"))
+    data = _sheet_png_bytes(prop_id, sheet_id)   # rebuilds from SVG if the PNG was deferred
     if data is None:
         raise HTTPException(status_code=404, detail="Sheet not found.")
-    return Response(data, media_type="image/png")
+    return Response(data, media_type="image/png",
+                    headers={"Cache-Control": IMMUTABLE_CACHE})
+
+
+@app.get("/sheets/{prop_id}/{sheet_id}.pdf")
+def get_sheet_pdf(prop_id, sheet_id):
+    """PDF export of a saved sheet: wrap its stored branded PNG (no separate .pdf
+    is persisted — _png_to_pdf is cheap and this stays a raster PDF matching the
+    PNG). Cache is immutable like the PNG; a re-save overwrites the same sheet_id,
+    so consumers cache-bust with the sheet's `?v={updated}` query (see Library.jsx)."""
+    _safe_id(prop_id, "property id")
+    _safe_id(sheet_id, "sheet id")
+    png = _sheet_png_bytes(prop_id, sheet_id)   # rebuilds from SVG if the PNG was deferred
+    if png is None:
+        raise HTTPException(status_code=404, detail="Sheet not found.")
+    return Response(_png_to_pdf(png), media_type="application/pdf",
+                    headers={"Cache-Control": IMMUTABLE_CACHE})
 
 
 class _DownloadItem(BaseModel):
@@ -911,14 +1138,17 @@ def download_sheets(req: DownloadRequest):
     pulling the saved branded artifacts."""
     if not req.items:
         raise HTTPException(status_code=400, detail="No sheets selected.")
-    exts = [e for e in ("svg", "png") if e in req.formats]   # filter + normalize order
+    exts = [e for e in ("svg", "png", "pdf") if e in req.formats]   # filter + normalize order
     if not exts:
-        raise HTTPException(status_code=400, detail="Pick at least one format (PNG or SVG).")
+        raise HTTPException(status_code=400, detail="Pick at least one format (PNG, SVG or PDF).")
     buf = io.BytesIO()
     used: Dict[str, int] = {}
     added = 0
-    # mirror Library.jsx exportName(): "<prop-slug>-<title-slug>" (+ "-plan")
-    slug = lambda s: (s or "floorplan").strip().replace(" ", "-").lower()
+    # mirror Library.jsx exportName(): "<prop-slug>-<title-slug>" (+ "-plan").
+    # Strip anything but [A-Za-z0-9._-] so a crafted title (".."/"/"/"\") can't
+    # produce a traversal-shaped ZIP entry name (zip-slip on a naive extractor).
+    slug = lambda s: (re.sub(r"[^A-Za-z0-9._-]+", "-", (s or "").strip())
+                      .strip("-.").lower() or "floorplan")
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for it in req.items:
             _safe_id(it.property_id, "property id")
@@ -938,12 +1168,24 @@ def download_sheets(req: DownloadRequest):
                 if not rendered:
                     continue
                 for ext in exts:
-                    data = rendered["svg"].encode("utf-8") if ext == "svg" else rendered["png"]
+                    if ext == "svg":
+                        data = rendered["svg"].encode("utf-8")
+                    elif ext == "pdf":
+                        data = _png_to_pdf(rendered["png"])
+                    else:
+                        data = rendered["png"]
                     zf.writestr(_zip_arcname(used, f"{name}.{ext}"), data)
                     added += 1
             else:
                 for ext in exts:
-                    data = storage.read_bytes(os.path.join(d, f"{it.sheet_id}.{ext}"))
+                    if ext == "svg":
+                        data = storage.read_bytes(os.path.join(d, f"{it.sheet_id}.svg"))
+                    else:
+                        # png/pdf both derive from the (possibly-deferred) sheet PNG,
+                        # rebuilt from the SVG on demand. No .pdf is ever persisted.
+                        data = _sheet_png_bytes(it.property_id, it.sheet_id)
+                        if data is not None and ext == "pdf":
+                            data = _png_to_pdf(data)
                     if data is not None:
                         zf.writestr(_zip_arcname(used, f"{name}.{ext}"), data)
                         added += 1
@@ -999,6 +1241,19 @@ def reopen_sheet(prop_id, sheet_id):
             except OSError:
                 pass   # preserved plate missing — picker just won't repaint
             break
+    # Guard stale paint: a DXF sheet's paint is a full-page overlay for the page
+    # it was saved against. If the engine's page has since changed (it was
+    # resized), that paint would land wrong on the new page — so drop it and flag,
+    # rather than silently misplacing it. The coordinator re-paints on the resized
+    # page. (Image-plan sheets page off the image's own size, so they're unaffected.)
+    cfg["paint_stale"] = False
+    if cfg.get("paint_image") and has_prims:
+        svg_txt = storage.read_text(os.path.join(d, f"{sheet_id}.svg")) or ""
+        current_pages = (f'viewBox="0 0 {_PAGE_W} {_PAGE_H}"',      # portrait
+                         f'viewBox="0 0 {_PAGE_H} {_PAGE_W}"')      # landscape
+        if svg_txt and not any(v in svg_txt for v in current_pages):
+            cfg["paint_image"] = None
+            cfg["paint_stale"] = True
     return cfg
 
 

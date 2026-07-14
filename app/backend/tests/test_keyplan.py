@@ -63,6 +63,40 @@ class KeyplanGroupTest(unittest.TestCase):
         self.assertIn("<rect", with_b)
         self.assertNotIn("<rect", without)
 
+    def test_highlight_box_shades_the_unit_cell(self):
+        """Highlight mode: a fractional box draws an accent-filled unit cell that
+        maps linearly onto the frame (ox + fx*w, oy + fy*h, fw*w, fh*h). The
+        callers pre-fit the frame to the image aspect, so this stays 1:1."""
+        svg = keyplan_group(fx.plate_png(), ox=10, oy=20, w=100, h=80,
+                            palette={"dark": "#000", "accent": "#C17F3A"},
+                            box=[0.25, 0.10, 0.50, 0.30])
+        m = re.search(r'<rect x="([\d.]+)" y="([\d.]+)" width="([\d.]+)" '
+                      r'height="([\d.]+)" fill="#C17F3A" fill-opacity="0.55"', svg)
+        self.assertIsNotNone(m, "no accent unit cell drawn for a highlight box")
+        self.assertEqual([float(g) for g in m.groups()], [35.0, 28.0, 50.0, 24.0])
+
+    def test_malformed_box_is_skipped_not_thrown(self):
+        """A junk box (from an old/garbled config) must not crash the render —
+        it's silently skipped, same as no box."""
+        svg = keyplan_group(fx.plate_png(), 0, 0, 100, 80,
+                            {"dark": "#000", "accent": "#C17F3A"},
+                            box=["x", None, 1, 2])   # len 4, non-numeric -> hits coercion guard
+        self.assertNotIn('fill-opacity="0.55"', svg)
+
+    def test_crafted_palette_cannot_break_out_of_svg_attributes(self):
+        """The palette is user-supplied (property setup / render override) and its
+        dark/accent values land in stroke=/fill= attributes here. A value that
+        isn't a #hex colour must be dropped to the default, not interpolated raw —
+        otherwise a crafted palette is stored XSS when the SVG is inlined in the
+        editor (dangerouslySetInnerHTML)."""
+        attack = '#fff"><script>alert(1)</script>'
+        svg = keyplan_group(fx.plate_png(), 0, 0, 100, 80,
+                            palette={"dark": attack, "accent": attack},
+                            box=[0.25, 0.10, 0.50, 0.30])
+        self.assertNotIn("<script>", svg)
+        self.assertNotIn(attack, svg)
+        ET.fromstring(f"<svg xmlns='http://www.w3.org/2000/svg'>{svg}</svg>")
+
 
 class KeyplanSheetTest(unittest.TestCase):
     def test_requires_a_plate(self):

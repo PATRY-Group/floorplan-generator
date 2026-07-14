@@ -98,9 +98,37 @@ class RenderOutputTest(unittest.TestCase):
         self.assertIn("FLOOR PLAN", svg)               # default header_right
         self.assertIn("FOR ILLUSTRATIVE PURPOSES ONLY", svg)
 
+    def test_footer_name_overrides_title_in_footer(self):
+        """The footer heading is the separate `footer_name` when set (the sheet
+        name / `title` names the library file, not the footer). With no
+        `footer_name`, the footer falls back to `title` — so pre-split sheets and
+        an empty footer field both keep the old behavior."""
+        with_footer, _, _ = self.render(
+            metadata={"title": "LIBRARY NAME", "footer_name": "Unit 2-E"})
+        self.assertIn("UNIT 2-E", with_footer)          # footer shows footer_name
+        self.assertNotIn(">LIBRARY NAME<", with_footer)  # not the sheet name
+        fallback, _, _ = self.render(metadata={"title": "LIBRARY NAME"})
+        self.assertIn("LIBRARY NAME", fallback)          # falls back to title
+
     def test_custom_palette_is_applied(self):
         svg, _, _ = self.render(palette={"light": "#ABCDEF"})
         self.assertIn("#ABCDEF", svg)
+
+    def test_sf_unit_appends_sf_by_default_without_doubling(self):
+        """The `sf_unit` toggle (default on) appends ' SF' to a bare number so
+        the coordinator types just the figure — but never doubles a value that
+        already carries the unit, and stays out entirely when toggled off."""
+        # default (no sf_unit key) -> append
+        bare, _, _ = self.render(metadata={"title": "T", "sf": "795"})
+        self.assertIn("795 SF", bare)
+        # already has the unit -> no double
+        withunit, _, _ = self.render(metadata={"title": "T", "sf": "795 SF"})
+        self.assertIn("795 SF", withunit)
+        self.assertNotIn("795 SF SF", withunit)
+        # toggled off -> verbatim, no unit tacked on
+        off, _, _ = self.render(metadata={"title": "T", "sf": "795", "sf_unit": False})
+        self.assertIn(">795<", off.replace("&#160;", "").replace("&#183;", ""))
+        self.assertNotIn("795 SF", off)
 
     def test_xml_escaping_of_metadata(self):
         """User text with XML metacharacters must be escaped, and the document
@@ -501,6 +529,52 @@ class PlanExtentsTest(unittest.TestCase):
             layer_map=DEFAULT_LAYER_MAP, metadata={"title": "T"}))
         # the full sheet still scales/anchors to the walls (byte-identical output)
         self.assertAlmostEqual(meta["extents"]["maxx"], 10, places=3)
+
+
+class WatermarkEscapeTest(unittest.TestCase):
+    def test_lockup_fallback_watermark_is_escaped_once(self):
+        """When the watermark falls back to the lockup, the value must be escaped
+        exactly once. The lockup is pre-escaped, so re-escaping it on the fallback
+        turned 'A&B' into the literal 'A&amp;amp;B'."""
+        prims = parse_unit_prims()
+        cfg = fx.base_render_config()
+        cfg["metadata"]["watermark"] = ""        # force the lockup fallback
+        cfg["metadata"]["lockup"] = "A&B"
+        svg, _, _ = render(prims, cfg)
+        self.assertIn("A&amp;B", svg)
+        self.assertNotIn("A&amp;amp;B", svg)
+
+
+class HexColorTest(unittest.TestCase):
+    """_safe_color gates palette values into #hex, and WALL flows on into _hex()
+    for the poché raster. A valid CSS short-hex (#000, #0a8) must parse to the
+    right RGB, not crash the render; an invalid-length hex (#12345) must be
+    rejected to the default, not parsed to garbage."""
+
+    def test_hex_expands_short_and_drops_alpha(self):
+        from engine.keyplan_trace import _hex
+        self.assertEqual(_hex("#ffffff"), (255, 255, 255))
+        self.assertEqual(_hex("#000000"), (0, 0, 0))
+        self.assertEqual(_hex("#000"), (0, 0, 0))          # would crash pre-fix
+        self.assertEqual(_hex("#0a8"), (0, 170, 136))      # doubled nibbles, not padded
+        self.assertEqual(_hex("#ff000080"), (255, 0, 0))   # 8-digit RGBA -> drop alpha
+        self.assertEqual(_hex("#0a8f"), (0, 170, 136))     # 4-digit RGBA short -> drop alpha
+
+    def test_safe_color_accepts_valid_css_lengths_only(self):
+        from engine.render import _safe_color
+        for good in ("#000", "#0a8", "#abcd", "#C17F3A", "#ff000080"):
+            self.assertEqual(_safe_color(good, "#111111"), good)
+        for bad in ("#12345", "#1234567", "red", "#gg0000", ""):
+            self.assertEqual(_safe_color(bad, "#111111"), "#111111")
+
+    def test_solid_wall_with_short_hex_does_not_crash(self):
+        """wall_style=solid rasters the poché via _hex(WALL); a #000 wall colour
+        used to raise ValueError deep in _hex -> 500."""
+        prims = parse_unit_prims()
+        cfg = fx.base_render_config(palette={"wall": "#000"})
+        cfg["metadata"]["wall_style"] = "solid"
+        svg, png, _ = render(prims, cfg)
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
 
 
 if __name__ == "__main__":
