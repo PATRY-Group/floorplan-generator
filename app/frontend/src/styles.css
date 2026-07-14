@@ -176,6 +176,15 @@ select, input[type="text"] {
 .btnrow { display: flex; gap: 8px; margin-top: 8px; }
 .btnrow .btn { width: auto; flex: 1; }
 
+/* key-plan rotate + size row: auto-width controls (no flex:1 wrapping), compact
+   stepper on the right. Wraps gracefully in a narrow sidebar. */
+.kp-controls { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+.kp-controls .btn { width: auto; padding: 7px 11px; font-size: 12px; line-height: 1; white-space: nowrap; }
+.kp-size { display: flex; align-items: center; gap: 6px; }
+.kp-size .lbl { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.kp-size .btn { min-width: 34px; padding: 7px 0; font-size: 16px; text-align: center; }
+.kp-pct { min-width: 46px; text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; }
+
 .chip {
   display: inline-block;
   background: var(--limestone);
@@ -935,10 +944,12 @@ select, input[type="text"] {
   border: 1px solid var(--line);
   border-radius: 6px;
   overflow: hidden;
-  cursor: crosshair;
   touch-action: none;
   user-select: none;
 }
+/* Only the highlight-mode box picker is interactive; the upload-mode preview
+   reuses .platepick without .draw and stays a plain, non-draggable image. */
+.platepick.draw { cursor: crosshair; }
 .platepick img { display: block; width: 100%; }
 .platebox {
   position: absolute;
@@ -946,4 +957,84 @@ select, input[type="text"] {
   border: 1.5px solid var(--ember);
   pointer-events: none;
 }
+
+/* Hover affordance on the mini preview: dim it and show a zoom glyph so it
+   reads as clickable. pointer-events:none so it never blocks drag-to-draw. */
+.kp-hover {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(43, 31, 20, 0);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease, background 0.12s ease;
+}
+.platepick.draw:hover .kp-hover {
+  opacity: 1;
+  background: rgba(43, 31, 20, 0.3);
+}
+.kp-hover .zoomglyph {
+  font-size: 22px;
+  line-height: 1;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.5));
+  transform: scale(0.85);
+  transition: transform 0.12s ease;
+}
+.platepick.draw:hover .kp-hover .zoomglyph { transform: scale(1); }
+
+/* ---- key-plan: zoom-to-draw (click the mini preview -> sharp-corner modal) ---- */
+.kp-zoom-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(43, 31, 20, 0.62);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.kp-zoom-modal {
+  background: #fff;
+  border: 1px solid var(--charcoal);
+  border-radius: 0;                 /* sharp corners */
+  box-shadow: 0 14px 48px rgba(0, 0, 0, 0.4);
+  max-width: 94vw;
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+}
+.kp-zoom-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--muted);
+}
+.kp-zoom-head .btn { width: auto; padding: 6px 16px; }
+.kp-zoom-body {
+  padding: 16px;
+  overflow: auto;
+  text-align: center;
+}
+/* Sized to the image (not width:100%) and tightly wrapping it, so the % box
+   overlay stays aligned. Rules come after .platepick img to win on source order. */
+.platepick.kp-zoom-surface {
+  display: inline-block;
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  line-height: 0;
+  max-width: 100%;
+}
+.platepick.kp-zoom-surface img {
+  width: auto;
+  max-width: 86vw;
+  max-height: 74vh;
+}
+
 .step h3 .toggle input { margin: 0; }
