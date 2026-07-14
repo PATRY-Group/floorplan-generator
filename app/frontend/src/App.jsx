@@ -186,7 +186,7 @@ function newDoc(propertyId) {
     rooms: [],
     deletedRooms: [],      // undo stack: { room, index }
     ignored: [],
-    meta: { title: "", suite: "", sf: "" },
+    meta: { title: "", footer_name: "", suite: "", sf: "" },
     suggestions: {},
     warnings: [],
     layerInferred: false,
@@ -257,6 +257,10 @@ export default function App() {
   const [tabOrient, setTabOrient] = useState("horizontal");  // "horizontal" | "vertical"
   const [railW, setRailW] = useState(170);
   const [railCollapsed, setRailCollapsed] = useState(false);
+  // Tab drag-reorder: dragId holds the doc being dragged (ref — dataTransfer isn't
+  // readable during dragover); dragOverId highlights the current drop target.
+  const dragId = useRef(null);
+  const [dragOverId, setDragOverId] = useState(null);
   const [railResizing, setRailResizing] = useState(false);
   const railResize = useRef(null);   // { startX, startW } while dragging the rail edge
   const [winW, setWinW] = useState(typeof window !== "undefined" ? window.innerWidth : 1400);
@@ -489,8 +493,24 @@ export default function App() {
     setActiveId(d.id);
     setOpenSection("upload");
   }
+  // Drag-reorder: move the dragged doc to the drop target's slot. Forward drags
+  // land the doc just after the target, backward drags just before — the standard
+  // splice-toward-target behavior. Order persists via the docs autosave.
+  function reorderDocs(fromId, toId) {
+    if (!fromId || fromId === toId) return;
+    setDocs((ds) => {
+      const from = ds.findIndex((d) => d.id === fromId);
+      const to = ds.findIndex((d) => d.id === toId);
+      if (from < 0 || to < 0) return ds;
+      const next = ds.slice();
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      return next;
+    });
+  }
   function closeTab(id) {
     delete renderSeq.current[id];   // drop the closed doc's per-doc render counter
+    delete savingDocs.current[id];  // …and its in-flight-save guard
     setDocs((ds) => {
       const idx = ds.findIndex((d) => d.id === id);
       const next = ds.filter((d) => d.id !== id);
@@ -645,8 +665,8 @@ export default function App() {
         const item = items[next++];
         setStatus(item.qid, { status: "parsing" });
         try {
-          const isPdf = item.fileName.toLowerCase().endsWith(".pdf");
-          const doc = isPdf
+          const isPlanImg = /\.(pdf|png|jpe?g)$/i.test(item.fileName);
+          const doc = isPlanImg
             ? { ...newDoc(prop), ...parsedPdfDocFields(await parsePlanPdf(item.file), item.fileName) }
             : { ...newDoc(prop), ...parsedDocFields(await parseFile(item.file, prop || undefined), item.fileName), fileObj: item.file };
           setDocs((ds) => [...ds, doc]);
@@ -924,20 +944,50 @@ export default function App() {
       a.href = "data:image/png;base64," + res.png_b64;
       a.download = `${exportName(d.propertyId, d.meta.title)}.png`;
       a.click();
+      return true;
     } catch (e) {
       if (!handleExpiredUpload(d, e)) toast(e.message, "error");
+      return false;
     } finally {
       setPngBusy(false);
     }
   }
-  // Run the two exports in sequence so the "Rendering…" affordance stays up until
-  // both finish (firing them concurrently let whichever resolved first clear it
-  // while the other was still in flight) and we don't kick off two renders at once.
-  async function downloadCurrentBoth() {
-    await downloadCurrentSvg();
-    await downloadCurrentPng();
+  // PDF is a single page wrapping the server-rendered PNG (same fonts/watermark/
+  // paint as the PNG export), sized to the sheet's own aspect at print DPI.
+  async function downloadCurrentPdf() {
+    const d = docs.find((x) => x.id === activeId);
+    if (!d || !d.docId) return;
+    setPngBusy(true);
+    try {
+      const res = await renderSheet({
+        doc_id: d.docId, property_id: d.propertyId || null,
+        metadata: d.meta, rooms: d.rooms, keyplan: d.keyplan || null, want_pdf: true,
+        paint_image: d.paintImage || null,
+      });
+      if (!res.pdf_b64) throw new Error("No PDF returned by the server.");
+      const a = document.createElement("a");
+      a.href = "data:application/pdf;base64," + res.pdf_b64;
+      a.download = `${exportName(d.propertyId, d.meta.title)}.pdf`;
+      a.click();
+      return true;
+    } catch (e) {
+      if (!handleExpiredUpload(d, e)) toast(e.message, "error");
+      return false;
+    } finally {
+      setPngBusy(false);
+    }
   }
-  // Bare line drawing — no header/footer/watermark. kind: "svg" | "png".
+  // Run the exports in sequence so the "Rendering…" affordance stays up until all
+  // finish (firing them concurrently let whichever resolved first clear it while
+  // the others were still in flight) and we don't kick off several renders at once.
+  // Stop on the first failure — e.g. once one export detects an expired upload
+  // and clears docId, the rest would only produce more error toasts.
+  async function downloadCurrentAll() {
+    if (!await downloadCurrentSvg()) return;
+    if (!await downloadCurrentPng()) return;
+    await downloadCurrentPdf();
+  }
+  // Bare line drawing — no header/footer/watermark. kind: "svg" | "png" | "pdf".
   async function downloadPlanOnly(kind) {
     const d = docs.find((x) => x.id === activeId);
     if (!d || !d.docId) return;
@@ -945,20 +995,24 @@ export default function App() {
     try {
       const res = await renderSheet({
         doc_id: d.docId, property_id: d.propertyId || null,
-        metadata: d.meta, rooms: d.rooms, plan_only: true, want_png: kind === "png",
+        metadata: d.meta, rooms: d.rooms, plan_only: true,
+        want_png: kind === "png", want_pdf: kind === "pdf",
         paint_image: d.paintImage || null,
       });
       const a = document.createElement("a");
       if (kind === "png") {
         if (!res.png_b64) throw new Error("No PNG returned by the server.");
         a.href = "data:image/png;base64," + res.png_b64;
+      } else if (kind === "pdf") {
+        if (!res.pdf_b64) throw new Error("No PDF returned by the server.");
+        a.href = "data:application/pdf;base64," + res.pdf_b64;
       } else {
         const blob = new Blob([res.svg], { type: "image/svg+xml" });
         a.href = URL.createObjectURL(blob);
       }
       a.download = `${exportName(d.propertyId, d.meta.title, "-plan")}.${kind}`;
       a.click();
-      if (kind !== "png") URL.revokeObjectURL(a.href);
+      if (kind === "svg") URL.revokeObjectURL(a.href);  // only the SVG path uses a blob URL
     } catch (e) {
       if (!handleExpiredUpload(d, e)) toast(e.message, "error");
     } finally {
@@ -974,7 +1028,7 @@ export default function App() {
     d.docId = cfg.doc_id;
     d.kind = cfg.kind || "dxf";
     d.rooms = (cfg.rooms || []).map((r) => ({ ...r }));
-    d.meta = cfg.metadata || { title: "", suite: "", sf: "" };
+    d.meta = cfg.metadata || { title: "", footer_name: "", suite: "", sf: "" };
     d.keyplan = cfg.keyplan || null;
     d.paintImage = cfg.paint_image || null;
     d.savedId = sheetId;            // re-saving overwrites this library entry
@@ -989,7 +1043,10 @@ export default function App() {
       setDocs((ds) => [...ds, d]);
       setActiveId(d.id);
       setOpenSection("details");
-      toast("Re-opened in a new tab — edit and re-save", "success");
+      if (cfg.paint_stale)
+        toast("Re-opened. Its paint was drawn for the old page size and was cleared — re-paint it on the resized sheet before exporting.", "info");
+      else
+        toast("Re-opened in a new tab — edit and re-save", "success");
     } catch (e) {
       toast(e.message, "error");
     }
@@ -1005,10 +1062,12 @@ export default function App() {
       `Open ${n} sheets in ${n} editor tabs? That's a lot of tabs at once.`)) return false;
     const opened = [];
     const failed = [];
+    let staleCount = 0;
     for (const it of items) {
       const prop = it.property_id || propertyId;
       try {
         const cfg = await reopenSheet(prop, it.sheet_id);
+        if (cfg.paint_stale) staleCount++;
         opened.push(docFromReopenCfg(cfg, prop, it.sheet_id, it.title));
       } catch (_) {
         failed.push(it.title || it.sheet_id);
@@ -1025,6 +1084,8 @@ export default function App() {
     } else {
       toast(`Re-opened ${opened.length} sheet${opened.length > 1 ? "s" : ""} in tabs — edit and re-save`, "success");
     }
+    if (staleCount)
+      toast(`${staleCount} sheet${staleCount > 1 ? "s" : ""} had paint from the old page size — it was cleared; re-paint before exporting.`, "info");
     return true;
   }
   async function removeSheet(s) {
@@ -1147,16 +1208,40 @@ export default function App() {
       <>
         {docs.map((d) => (
           <span key={d.id}
-            className={"tab" + (activeId === d.id ? " active" : "")}
+            className={"tab" + (activeId === d.id ? " active" : "") + (dragOverId === d.id ? " dragover" : "")}
             title={tabLabelUnique(d)}
-            onClick={() => setActiveId(d.id)}>
+            role="button" tabIndex={0}
+            onClick={() => setActiveId(d.id)}
+            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setActiveId(d.id); } }}
+            draggable
+            onDragStart={(e) => {
+              dragId.current = d.id;
+              e.dataTransfer.effectAllowed = "move";
+              e.dataTransfer.setData("text/plain", d.id);   // required or Firefox won't start the drag
+            }}
+            onDragOver={(e) => {
+              e.preventDefault();   // without this, onDrop never fires
+              e.dataTransfer.dropEffect = "move";
+              if (dragId.current && dragId.current !== d.id && dragOverId !== d.id) setDragOverId(d.id);
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              reorderDocs(dragId.current, d.id);
+              dragId.current = null;
+              setDragOverId(null);
+            }}
+            onDragEnd={() => { dragId.current = null; setDragOverId(null); }}>
             <span className="tablabel">{midTruncate(tabLabelUnique(d))}</span>
-            <span className="tabx" title="Close" onClick={(e) => { e.stopPropagation(); requestCloseTab(d.id); }}>×</span>
+            <span className="tabx" title="Close" role="button" tabIndex={0}
+              onClick={(e) => { e.stopPropagation(); requestCloseTab(d.id); }}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.stopPropagation(); e.preventDefault(); requestCloseTab(d.id); } }}>×</span>
           </span>
         ))}
         <button className="tab newtab" title="New floor plan" onClick={newTab}>+</button>
         <span className={"tab library-tab" + (activeId === "library" ? " active" : "")}
-          onClick={() => setActiveId("library")}>
+          role="button" tabIndex={0}
+          onClick={() => setActiveId("library")}
+          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setActiveId("library"); } }}>
           Library{sheets.length ? ` (${sheets.length})` : ""}
         </span>
       </>
@@ -1256,14 +1341,15 @@ export default function App() {
               </span>
             </h3>
             <label className="drop">
-              {parsing ? "Parsing…" : (active && active.fileName ? active.fileName : "Select up to 10 DXF or PDF files")}
-              <input type="file" multiple accept=".dxf,.dwg,.pdf"
+              {parsing ? "Parsing…" : (active && active.fileName ? active.fileName : "Select up to 10 DXF, PDF, or PNG files")}
+              <input type="file" multiple accept=".dxf,.dwg,.pdf,.png,.jpg,.jpeg"
+                disabled={parsing}
                 onChange={(e) => { handleFiles(e.target.files); e.target.value = ""; }} />
             </label>
             {caps && (
               <p className="subtle" style={{ marginTop: 6 }}>
-                Accepts {caps.formats_accepted.join(", ").toUpperCase()}, or a PDF of an
-                already-finished floor plan (single page — just adds the branding).
+                Accepts {caps.formats_accepted.join(", ").toUpperCase()}, or a PDF/PNG/JPG of an
+                already-finished floor plan (just adds the branding).
                 {!caps.dwg_conversion && " DWG needs the ODA converter on the server."}
                 {" "}.rvt is not supported — export a DXF view from Revit.
               </p>
@@ -1274,7 +1360,7 @@ export default function App() {
             <>
               <div className="step">
                 <h3><span className="num">3</span> Unit details</h3>
-                <label>Unit name (shown on the sheet footer)</label>
+                <label>File name (in library)</label>
                 <input type="text" value={active.meta.title}
                   onChange={(e) => patchActive((d) => ({ meta: { ...d.meta, title: e.target.value } }))}
                   placeholder="ONE BED" />
@@ -1284,6 +1370,13 @@ export default function App() {
                     use “{active.suggestions.title}”
                   </button>
                 )}
+                <label>Footer name (on sheet footer)</label>
+                <input type="text" value={active.meta.footer_name || ""}
+                  onChange={(e) => patchActive((d) => ({ meta: { ...d.meta, footer_name: e.target.value } }))}
+                  placeholder={active.meta.title || "ONE BED"} />
+                <p className="subtle" style={{ marginTop: 4 }}>
+                  Leave blank to use the sheet name.
+                </p>
                 <div className="row">
                   <div>
                     <label>Suite</label>
@@ -1295,7 +1388,12 @@ export default function App() {
                     <label>Square footage</label>
                     <input type="text" value={active.meta.sf}
                       onChange={(e) => patchActive((d) => ({ meta: { ...d.meta, sf: e.target.value } }))}
-                      placeholder="517 SF" />
+                      placeholder={active.meta.sf_unit !== false ? "517" : "517 SF"} />
+                    <label className="toggle" style={{ marginTop: 6 }}>
+                      <input type="checkbox" checked={active.meta.sf_unit !== false}
+                        onChange={(e) => patchActive((d) => ({ meta: { ...d.meta, sf_unit: e.target.checked } }))} />
+                      Auto-append “SF”
+                    </label>
                   </div>
                 </div>
               </div>
@@ -1367,6 +1465,7 @@ export default function App() {
 
               <KeyPlanPanel key={active.id}
                 initial={active.keyplan}
+                palette={(properties.find((p) => p.id === active.propertyId) || {}).palette || {}}
                 onChange={(kp) => patchActive({ keyplan: kp })} />
             </>
           )}
@@ -1499,12 +1598,15 @@ export default function App() {
                     <>
                       <div className="dropdown-backdrop" onClick={() => setDlOpen(false)} />
                       <div className="menu">
-                        <button onClick={() => { setDlOpen(false); downloadCurrentSvg(); }}>SVG</button>
+                        <button disabled={pngBusy}
+                          onClick={() => { setDlOpen(false); downloadCurrentSvg(); }}>SVG</button>
                         <button disabled={pngBusy}
                           onClick={() => { setDlOpen(false); downloadCurrentPng(); }}>PNG</button>
                         <button disabled={pngBusy}
-                          onClick={() => { setDlOpen(false); downloadCurrentBoth(); }}>
-                          SVG + PNG
+                          onClick={() => { setDlOpen(false); downloadCurrentPdf(); }}>PDF</button>
+                        <button disabled={pngBusy}
+                          onClick={() => { setDlOpen(false); downloadCurrentAll(); }}>
+                          All (SVG + PNG + PDF)
                         </button>
                         <div className="menu-sep" />
                         <div className="menu-label">Plan only — no branding</div>
@@ -1515,6 +1617,10 @@ export default function App() {
                         <button disabled={pngBusy}
                           onClick={() => { setDlOpen(false); downloadPlanOnly("png"); }}>
                           Plan PNG
+                        </button>
+                        <button disabled={pngBusy}
+                          onClick={() => { setDlOpen(false); downloadPlanOnly("pdf"); }}>
+                          Plan PDF
                         </button>
                       </div>
                     </>
@@ -1585,6 +1691,11 @@ export default function App() {
                   onClick={() => patchActive((d) => ({ meta: { ...d.meta, hide_watermark: !d.meta.hide_watermark } }))}
                   title="Hide the ghost watermark (e.g. while painting) — affects preview and export">
                   {active.meta.hide_watermark ? "✓ No watermark" : "Watermark"}
+                </button>
+                <button className={"btn ghost" + (active.meta.orientation === "landscape" ? " active" : "")}
+                  onClick={() => patchActive((d) => ({ meta: { ...d.meta, orientation: d.meta.orientation === "landscape" ? "portrait" : "landscape" } }))}
+                  title="Toggle the page orientation — Portrait (8.5×11) vs Landscape (11×8.5)">
+                  {active.meta.orientation === "landscape" ? "▭ Landscape" : "▯ Portrait"}
                 </button>
                 <button className="btn ghost icon" disabled={rendering} onClick={() => doRender(false)}
                   title="Reload — re-render the preview (e.g. after editing the property's brand)">

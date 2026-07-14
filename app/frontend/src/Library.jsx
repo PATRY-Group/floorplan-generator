@@ -188,7 +188,7 @@ export default function Library({ sheets, onReopen, onDelete, onRename, onBatchD
     const items = selectedSheets()
       .map((s) => ({ property_id: s.property_id, sheet_id: s.sheet_id }));
     if (!items.length) return;
-    const formats = format === "both" ? ["png", "svg"] : [format];
+    const formats = format === "all" ? ["png", "svg", "pdf"] : [format];
     setDownloading(true);
     try {
       const blob = await downloadSheets(items, formats, planOnly);
@@ -262,10 +262,12 @@ export default function Library({ sheets, onReopen, onDelete, onRename, onBatchD
                       <div className="libsubmenu">
                         <button onClick={() => downloadSelected("png")}>PNG</button>
                         <button onClick={() => downloadSelected("svg")}>SVG</button>
-                        <button onClick={() => downloadSelected("both")}>PNG + SVG</button>
+                        <button onClick={() => downloadSelected("pdf")}>PDF</button>
+                        <button onClick={() => downloadSelected("all")}>All (SVG + PNG + PDF)</button>
                         <div className="libsub-label">Plan only — no branding</div>
                         <button onClick={() => downloadSelected("svg", true)}>Plan SVG</button>
                         <button onClick={() => downloadSelected("png", true)}>Plan PNG</button>
+                        <button onClick={() => downloadSelected("pdf", true)}>Plan PDF</button>
                       </div>
                     )}
                     <div className="libmenu-sep" />
@@ -340,6 +342,8 @@ export default function Library({ sheets, onReopen, onDelete, onRename, onBatchD
                    download={`${exportName(s.property_id, s.title)}.svg`}>SVG</a>
                 <a href={sheetUrl(s.property_id, s.sheet_id, "png") + bust} target="_blank" rel="noreferrer"
                    download={`${exportName(s.property_id, s.title)}.png`}>PNG</a>
+                <a href={sheetUrl(s.property_id, s.sheet_id, "pdf") + bust} target="_blank" rel="noreferrer"
+                   download={`${exportName(s.property_id, s.title)}.pdf`}>PDF</a>
                 {s.keyplan && (
                   <a href={sheetUrl(s.property_id, `${s.sheet_id}-keyplan`, "svg") + bust}
                      target="_blank" rel="noreferrer"
