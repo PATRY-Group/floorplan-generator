@@ -415,6 +415,10 @@ select, input[type="text"] {
   color: var(--charcoal);
   font-weight: 600;
 }
+/* Drag-reorder drop indicator: an ember bar on the leading edge of the target
+   tab — left edge in the horizontal strip, top edge in the vertical rail. */
+.tabs .tab.dragover { box-shadow: inset 3px 0 0 var(--ember); }
+.tabrail .tab.dragover { box-shadow: inset 0 3px 0 var(--ember); }
 .tab .tablabel { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 150px; }
 .tabx { font-size: 14px; line-height: 1; color: var(--muted); border-radius: 3px; padding: 0 3px; }
 .tabx:hover { color: #8a3d28; background: rgba(138, 61, 40, 0.12); }
@@ -602,7 +606,7 @@ select, input[type="text"] {
 /* aspect-ratio reserves the card's height before the thumb loads: without it a
    lazy <img> has zero height, so every card sits in the viewport at once and
    loading="lazy" defers nothing. Matches the sheet page ratio (PAGE_W:PAGE_H). */
-.libcard img { width: 100%; display: block; aspect-ratio: 1000 / 1080; object-fit: cover; }
+.libcard img { width: 100%; display: block; aspect-ratio: 1000 / 1294; object-fit: cover; }
 .libthumb { position: relative; display: block; }
 .thumbhint {
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;

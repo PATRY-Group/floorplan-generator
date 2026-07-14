@@ -22,7 +22,7 @@ const UNDO_CAP = 20;
 
 export default function PaintCanvas({
   active, tool = "brush", color = "#ffffff", size = 6,
-  initialImage = null, page = { w: 1000, h: 1080 },
+  initialImage = null, page = { w: 1000, h: 1294 },
   onPaintChange, registerUndo,
 }) {
   const canvasRef = useRef(null);
@@ -30,6 +30,8 @@ export default function PaintCanvas({
   const last = useRef(null);          // last point in backing coords (brush/eraser)
   const undoStack = useRef([]);       // dataURL snapshots, pre-stroke
   const loaded = useRef(null);        // last dataURL we drew or emitted (round-trip guard)
+  const seedGen = useRef(0);          // bumped per seed; a stale async onload won't draw
+  const lastDims = useRef({ w: 0, h: 0 });  // detect a page-size change (resize clears the bitmap)
   const [rubber, setRubber] = useState(null);  // live rect drag box (css px, overlayhost space)
 
   // latest tool params + emit callback, read by handlers without re-binding
@@ -51,17 +53,28 @@ export default function PaintCanvas({
   // tab switch. Skips the round-trip where our own emitted dataURL comes back as
   // a prop, so a stroke never triggers a reload/flicker.
   useEffect(() => {
-    if (initialImage === loaded.current) return;
+    // A page-size change (the Portrait/Landscape toggle) updates w/h, which
+    // clears the bitmap via the <canvas> width/height attributes. We MUST redraw
+    // even when initialImage is unchanged, or the canvas goes blank while the doc
+    // still holds paint (and the next stroke then overwrites it). So skip only a
+    // pure round-trip AT THE SAME SIZE; a resize always redraws (paint stretches
+    // to the new page, matching the backend's preserveAspectRatio="none" embed).
+    const resized = lastDims.current.w !== w || lastDims.current.h !== h;
+    lastDims.current = { w, h };
+    if (initialImage === loaded.current && !resized) return;
     loaded.current = initialImage;
     // External bitmap swap (mount / tab switch / reopen) — drop the prior doc's
     // undo history so Ctrl+Z can't paint one doc's strokes onto another.
     undoStack.current = [];
     const c = ctx();
     if (!c) return;
+    const gen = ++seedGen.current;
     c.clearRect(0, 0, w, h);
     if (initialImage) {
       const img = new Image();
-      img.onload = () => c.drawImage(img, 0, 0, w, h);
+      // Guard the async decode: if a newer seed (reopen / orientation change)
+      // started meanwhile, don't draw this stale image over it.
+      img.onload = () => { if (gen === seedGen.current) c.drawImage(img, 0, 0, w, h); };
       img.src = initialImage;
     }
   }, [initialImage, ctx, w, h]);

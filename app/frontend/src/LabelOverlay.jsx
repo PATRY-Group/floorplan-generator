@@ -26,7 +26,7 @@ export default function LabelOverlay({
   const [selected, setSelected] = useState(null);
   const [pending, setPending] = useState(null); // {i, x, y} viewBox coords, local nudge accumulator
 
-  const page = (meta && meta.page) || { w: 1000, h: 1080 };
+  const page = (meta && meta.page) || { w: 1000, h: 1294 };
   const placements = (meta && meta.placements) || [];
 
   const measure = useCallback(() => {
