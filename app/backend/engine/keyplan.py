@@ -14,19 +14,24 @@ footprint, or add a north arrow — we just crop and frame what the user gives u
 """
 
 import base64
-import html
 import io
+import math
+import re
 from PIL import Image, ImageChops
 
-PAGE_W, PAGE_H = 1000, 1080
-HEADER_H = 92
-FOOTER_H = 140
-PLAN_MAX_W, PLAN_MAX_H = 800, 640
-
-DEFAULT_SERIF = "Georgia, 'Times New Roman', serif"
-DEFAULT_SANS = "'Helvetica Neue', Helvetica, Arial, sans-serif"
-
 _PDF_PLAN_MAX_DIM = 2200   # longest edge, in px, for a print-quality plan rasterization
+
+# Palette colours reach keyplan_group's stroke=/fill= attributes raw (via the
+# render.py callers, which pass the whole palette dict). Gate them to a #hex
+# colour here too — render.py has its own _safe_color, but re-importing it would
+# be a circular import (render imports this module), and a fragment injected via
+# dangerouslySetInnerHTML must never carry an unvalidated attribute value.
+_HEX_COLOR_RE = re.compile(r"^#([0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+
+
+def _safe_color(value, default):
+    v = (value or "").strip()
+    return v if _HEX_COLOR_RE.match(v) else default
 
 
 class PdfPlanError(ValueError):
@@ -69,18 +74,6 @@ def pdf_to_png(raw_bytes, target_max_dim=_PDF_PLAN_MAX_DIM):
         return buf.getvalue()
     finally:
         doc.close()
-
-
-def _font_stack(value, generic):
-    """Quote a bare brand family name into a valid CSS stack (see the twin in
-    render.py for the full rationale): unquoted, a name like "Inter 18pt" is
-    invalid CSS and browsers fall back to serif, while the PNG renders fine.
-    Values already containing a comma (a stack) pass through untouched."""
-    v = (value or "").strip()
-    if not v or "," in v:
-        return value or ""
-    fam = v.replace("\\", "").replace("'", "")
-    return f"'{fam}', {generic}"
 
 
 def img_size(plate_bytes):
@@ -134,73 +127,93 @@ def _data_uri(plate_bytes):
     return f"data:{mime};base64,{b64}"
 
 
-def keyplan_group(plate_bytes, ox, oy, w, h, palette, with_border=True):
+def rotate_plate(plate_bytes, angle):
+    """Rotate a key-plan raster by `angle` degrees CLOCKWISE (0/90/180/270).
+    Lossless 90° transposes (no resampling); returns the input unchanged for angle
+    0 or anything that isn't a right-angle multiple. Aspect swaps for 90/270, so
+    callers that fit a box to img_size() get the rotated dimensions naturally."""
+    try:
+        a = int(angle or 0) % 360
+        if a == 0 or a % 90 != 0:
+            return plate_bytes
+        im = Image.open(io.BytesIO(plate_bytes))
+        # PIL's ROTATE_n is counter-clockwise; map clockwise degrees onto it.
+        tmap = {90: Image.Transpose.ROTATE_270,
+                180: Image.Transpose.ROTATE_180,
+                270: Image.Transpose.ROTATE_90}
+        im = im.transpose(tmap[a])
+        buf = io.BytesIO()
+        im.save(buf, "PNG")
+        return buf.getvalue()
+    except Exception:
+        return plate_bytes
+
+
+def rotate_box(box, angle):
+    """Rotate a highlight box `[fx, fy, fw, fh]` (fractions of the image, top-left
+    origin) to match a clockwise `rotate_plate(..., angle)` so the shaded unit cell
+    still lands on the right spot after the raster is turned."""
+    if not box or len(box) != 4:
+        return box
+    a = int(angle or 0) % 360
+    try:
+        fx, fy, fw, fh = (float(v) for v in box)
+    except (TypeError, ValueError):
+        return box
+    if a == 90:
+        return [1 - fy - fh, fx, fh, fw]
+    if a == 180:
+        return [1 - fx - fw, 1 - fy - fh, fw, fh]
+    if a == 270:
+        return [fy, 1 - fx - fw, fh, fw]
+    return box
+
+
+def keyplan_group(plate_bytes, ox, oy, w, h, palette, with_border=True, box=None,
+                  img_href=None):
     """SVG fragment: the (pre-cropped) key-plan image framed in box (ox,oy,w,h)
-    and embedded at full opacity. The image is the finished key plan the user
-    exported — the unit is already marked on it — so we just frame and place it.
+    and embedded at full opacity.
+
+    Two intake modes share this helper (spec §6):
+      - "upload"    -> the image is the finished key plan (unit already marked);
+                       `box` is None and we just frame and place it.
+      - "highlight" -> the image is a plain floor-plate and the user drew a
+                       rectangle over their unit in the app; `box` =
+                       [fx, fy, fw, fh] as fractions of the image, drawn here as
+                       a shaded accent cell.
 
     The caller fits (ox,oy,w,h) to the image's aspect ratio, so the embed
-    preserves aspect (`xMidYMid meet`) and the optional border hugs the image.
+    preserves aspect (`xMidYMid meet`) with no letterbox — which is why the
+    fractional `box` maps linearly onto (ox,oy,w,h). `box` is a TRAILING
+    optional param so the finished-PDF/image floor-plan callers (render.py) that
+    reuse this helper never get a unit box.
+
+    `img_href`, when given, replaces the inlined base64 data URI with a plain URL
+    (e.g. /planimg/{doc_id}) — used by live previews to avoid re-shipping a
+    multi-MB raster on every render. Saved artifacts pass None so they stay
+    self-contained.
     """
-    dark = palette.get("dark", "#2B1F14")
+    dark = _safe_color(palette.get("dark"), "#2B1F14")
+    accent = _safe_color(palette.get("accent"), "#C17F3A")
     parts = []
     if with_border:
         parts.append(f'<rect x="{ox:.1f}" y="{oy:.1f}" width="{w:.1f}" '
                      f'height="{h:.1f}" fill="#FFFFFF" stroke="{dark}" '
                      f'stroke-width="1.1"/>')
-    parts.append(f'<image href="{_data_uri(plate_bytes)}" x="{ox:.1f}" '
+    parts.append(f'<image href="{img_href or _data_uri(plate_bytes)}" x="{ox:.1f}" '
                  f'y="{oy:.1f}" width="{w:.1f}" height="{h:.1f}" '
                  f'preserveAspectRatio="xMidYMid meet"/>')
+    if box and len(box) == 4:
+        try:
+            fx, fy, fw, fh = (float(v) for v in box)
+        except (TypeError, ValueError):
+            fx = fy = fw = fh = 0.0                   # malformed -> skip, don't throw
+        # Reject non-finite (inf would emit width="inf", invalid SVG; nan is
+        # already falsy against > 0).
+        if all(math.isfinite(v) for v in (fx, fy, fw, fh)) and fw > 0 and fh > 0:
+            parts.append(
+                f'<rect x="{ox + fx * w:.1f}" y="{oy + fy * h:.1f}" '
+                f'width="{fw * w:.1f}" height="{fh * h:.1f}" '
+                f'fill="{accent}" fill-opacity="0.55" '
+                f'stroke="{accent}" stroke-width="1.5"/>')
     return "\n".join(parts)
-
-
-def render_keyplan_sheet(config):
-    """Standalone branded key-plan page."""
-    palette = config.get("palette") or {}
-    dark = palette.get("dark", "#2B1F14")
-    accent = palette.get("accent", "#C17F3A")
-    mid = palette.get("mid", "#E8D9C0")
-    light = palette.get("light", "#F7F3ED")
-    fonts = config.get("fonts") or {}
-    serif = _font_stack(fonts.get("serif", DEFAULT_SERIF), "serif")
-    sans = _font_stack(fonts.get("sans", DEFAULT_SANS), "sans-serif")
-
-    meta = config.get("metadata") or {}
-    kp = config.get("keyplan") or {}
-    plate = kp.get("plate_bytes")
-    if not plate:
-        raise ValueError("No plate image provided for the key plan.")
-
-    esc = html.escape
-    prop_name = esc((meta.get("property_name") or "").upper())
-    location = esc((meta.get("location") or "").upper())
-    lockup = esc(meta.get("lockup") or "")
-    title = esc((meta.get("title") or "").upper())
-    floor_label = esc((kp.get("floor_label") or "").upper())
-    footer_addr = esc((meta.get("footer_address") or "").upper())
-
-    iw, ih = img_size(plate)
-    s = min(PLAN_MAX_W / max(iw, 1), PLAN_MAX_H / max(ih, 1))
-    pw, ph = iw * s, ih * s
-    ox = (PAGE_W - pw) / 2
-    oy = HEADER_H + (PAGE_H - HEADER_H - FOOTER_H - ph) / 2
-    group = keyplan_group(plate, ox, oy, pw, ph, palette)
-
-    return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {PAGE_W} {PAGE_H}" font-family="{sans}">
-  <rect width="{PAGE_W}" height="{PAGE_H}" fill="{light}"/>
-  <rect width="{PAGE_W}" height="{HEADER_H}" fill="{dark}"/>
-  <text x="60" y="62" font-family="{serif}" font-weight="bold" font-size="44" fill="{accent}">{lockup}</text>
-  <text x="192" y="50" font-size="21" letter-spacing="7" fill="#FFFFFF">{prop_name}</text>
-  <text x="192" y="71" font-size="11" letter-spacing="4" fill="{mid}" fill-opacity="0.85">{location}</text>
-  <text x="{PAGE_W-60}" y="56" text-anchor="end" font-size="11" letter-spacing="3.5" fill="{mid}" fill-opacity="0.7">KEY PLAN</text>
-
-  {group}
-  <text x="{PAGE_W/2:.0f}" y="{oy - 14:.0f}" text-anchor="middle" font-size="11" letter-spacing="3" fill="{dark}" fill-opacity="0.6">{floor_label}</text>
-  <text x="{PAGE_W/2:.0f}" y="{oy + ph + 26:.0f}" text-anchor="middle" font-size="10" letter-spacing="2.5" fill="{dark}" fill-opacity="0.5">SCHEMATIC KEY PLAN — NOT TO SCALE</text>
-
-  <rect y="{PAGE_H-FOOTER_H}" width="{PAGE_W}" height="{FOOTER_H}" fill="{dark}"/>
-  <text x="60" y="{PAGE_H-FOOTER_H+62}" font-family="{serif}" font-size="40" fill="#FFFFFF">{title}</text>
-  <line x1="62" y1="{PAGE_H-FOOTER_H+80}" x2="122" y2="{PAGE_H-FOOTER_H+80}" stroke="{accent}" stroke-width="2.5"/>
-  <text x="60" y="{PAGE_H-FOOTER_H+106}" font-size="12.5" letter-spacing="3" fill="{mid}">{floor_label}</text>
-  <text x="{PAGE_W-60}" y="{PAGE_H-FOOTER_H+62}" text-anchor="end" font-size="12" letter-spacing="2.5" fill="{accent}">{footer_addr}</text>
-</svg>'''

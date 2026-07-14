@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
+from typing import Any
 
 from fastapi import HTTPException, UploadFile
 
@@ -29,9 +30,9 @@ from main import (RenderRequest, Property, do_render, compose_config,
                   _safe_id, sweep_uploads, capabilities, health,
                   put_property, get_property, list_properties, delete_property,
                   list_sheets, reopen_sheet, delete_sheet, get_sheet_svg,
-                  get_sheet_png, get_sheet_thumb, parse as parse_endpoint,
+                  get_sheet_png, get_sheet_pdf, get_sheet_thumb, parse as parse_endpoint,
                   _apply_custom_fonts, upload_plan_pdf,
-                  DownloadRequest, download_sheets)
+                  DownloadRequest, _DownloadItem, download_sheets)
 
 
 class _TempDataDirs(unittest.TestCase):
@@ -192,6 +193,41 @@ class PaintPersistenceTest(_TempDataDirs):
         # reopen returns the paint_image so the editor can restore the canvas
         reopened = reopen_sheet("acme", sid)
         self.assertEqual(reopened["paint_image"], uri)
+        self.assertFalse(reopened["paint_stale"])   # saved at the current page aspect
+
+    def test_stale_aspect_paint_is_dropped_and_flagged_on_reopen(self):
+        """A sheet saved against a DIFFERENT page (the page was later resized) has
+        full-page paint for the old aspect that would land wrong on the new page.
+        Reopen must drop it and set paint_stale so the UI can tell the user to
+        re-paint — not silently misplace it."""
+        doc = self._cache_prims()
+        put_property("acme", Property(id="acme", name="ACME"))
+        uri = "data:image/png;base64,PAINTBYTES"
+        out = do_render(RenderRequest(doc_id=doc, property_id="acme",
+                                      metadata={"title": "2 BED"},
+                                      paint_image=uri, save=True))
+        sid = out["sheet_id"]
+        # Rewrite the saved SVG to an old-aspect page (1000x1080, pre-resize).
+        svg_path = os.path.join(main.SHEET_DIR, "acme", f"{sid}.svg")
+        main.storage.write_text(
+            svg_path, '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1080"></svg>')
+        reopened = reopen_sheet("acme", sid)
+        self.assertTrue(reopened["paint_stale"])
+        self.assertIsNone(reopened["paint_image"])
+
+    def test_current_landscape_paint_is_kept_on_reopen(self):
+        """A current-aspect LANDSCAPE sheet (viewBox 1294x1000) must NOT be flagged
+        stale — the guard's landscape page string has to match real output, or good
+        paint gets dropped on reopen."""
+        doc = self._cache_prims()
+        put_property("acme", Property(id="acme", name="ACME"))
+        uri = "data:image/png;base64,PAINTBYTES"
+        out = do_render(RenderRequest(doc_id=doc, property_id="acme",
+                                      metadata={"title": "2 BED", "orientation": "landscape"},
+                                      paint_image=uri, save=True))
+        reopened = reopen_sheet("acme", out["sheet_id"])
+        self.assertFalse(reopened["paint_stale"])
+        self.assertEqual(reopened["paint_image"], uri)
 
 
 class PropertyCrudTest(_TempDataDirs):
@@ -341,7 +377,7 @@ class DownloadPlanOnlyTest(_TempDataDirs):
         import zipfile
         sid = self._save(self._cache_planimg(), "acme", "PDF UNIT")
         resp = download_sheets(DownloadRequest(
-            items=[{"property_id": "acme", "sheet_id": sid}],
+            items=[_DownloadItem(property_id="acme", sheet_id=sid)],
             formats=["png"], plan_only=True))
         zf = zipfile.ZipFile(io.BytesIO(resp.body))
         self.assertEqual(len(zf.namelist()), 1)
@@ -350,10 +386,33 @@ class DownloadPlanOnlyTest(_TempDataDirs):
         import zipfile
         sid = self._save(self._cache_prims(), "acme2", "DXF UNIT")
         resp = download_sheets(DownloadRequest(
-            items=[{"property_id": "acme2", "sheet_id": sid}],
+            items=[_DownloadItem(property_id="acme2", sheet_id=sid)],
             formats=["png"], plan_only=True))
         zf = zipfile.ZipFile(io.BytesIO(resp.body))
         self.assertEqual(len(zf.namelist()), 1)
+
+    def test_saved_sheet_pdf_route_wraps_the_png(self):
+        sid = self._save(self._cache_prims(), "acme3", "DXF UNIT")
+        resp = get_sheet_pdf("acme3", sid)
+        self.assertEqual(resp.media_type, "application/pdf")
+        self.assertTrue(bytes(resp.body).startswith(b"%PDF-"))
+
+    def test_pdf_route_404_for_unknown_sheet(self):
+        with self.assertRaises(HTTPException) as ctx:
+            get_sheet_pdf("acme3", "nope")
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_batch_zip_pdf_synthesized_from_saved_png(self):
+        import zipfile
+        sid = self._save(self._cache_prims(), "acme4", "DXF UNIT")
+        resp = download_sheets(DownloadRequest(
+            items=[_DownloadItem(property_id="acme4", sheet_id=sid)],
+            formats=["pdf"]))  # branded (not plan_only): reads saved .png, wraps it
+        zf = zipfile.ZipFile(io.BytesIO(resp.body))
+        names = zf.namelist()
+        self.assertEqual(len(names), 1)
+        self.assertTrue(names[0].endswith(".pdf"))
+        self.assertTrue(zf.read(names[0]).startswith(b"%PDF-"))
 
 
 class SheetThumbnailTest(_TempDataDirs):
@@ -364,29 +423,31 @@ class SheetThumbnailTest(_TempDataDirs):
                                       metadata={"title": "2 BED"}, save=True))
         return out["sheet_id"]
 
-    def test_thumbnail_built_on_save_and_downscaled(self):
+    def test_thumbnail_built_lazily_and_downscaled(self):
         import io
         from PIL import Image
         sid = self._save_sheet()
-        # save pre-builds the thumb so the library grid never fetches the full sheet
-        thumb_path = os.path.join(main.SHEET_DIR, "acme", f"{sid}.thumb.png")
-        self.assertTrue(os.path.exists(thumb_path))
-
+        # A plain save defers the raster — neither the PNG nor the thumb exist yet.
+        d = os.path.join(main.SHEET_DIR, "acme")
+        self.assertFalse(os.path.exists(os.path.join(d, f"{sid}.thumb.png")))
+        self.assertFalse(os.path.exists(os.path.join(d, f"{sid}.png")))
+        # First fetch rebuilds from the SVG, downscales, and caches back.
         thumb = get_sheet_thumb("acme", sid)
         self.assertEqual(thumb.media_type, "image/png")
+        self.assertTrue(os.path.exists(os.path.join(d, f"{sid}.thumb.png")))
         tw, _ = Image.open(io.BytesIO(bytes(thumb.body))).size
         fw, _ = Image.open(io.BytesIO(bytes(get_sheet_png("acme", sid).body))).size
         self.assertLessEqual(tw, main.THUMB_W)   # never wider than the cap
         self.assertLess(tw, fw)                  # and smaller than the full sheet
 
-    def test_thumbnail_regenerated_lazily_for_legacy_sheet(self):
+    def test_thumbnail_regenerated_when_deleted(self):
         sid = self._save_sheet()
-        # an older sheet saved before thumbnails existed: only the full PNG is present
-        os.remove(os.path.join(main.SHEET_DIR, "acme", f"{sid}.thumb.png"))
-        thumb = get_sheet_thumb("acme", sid)        # generated on demand from the full PNG
+        d = os.path.join(main.SHEET_DIR, "acme")
+        get_sheet_thumb("acme", sid)                 # build + cache once
+        os.remove(os.path.join(d, f"{sid}.thumb.png"))
+        thumb = get_sheet_thumb("acme", sid)         # regenerated on demand
         self.assertEqual(thumb.media_type, "image/png")
-        self.assertTrue(os.path.exists(             # and cached back for next time
-            os.path.join(main.SHEET_DIR, "acme", f"{sid}.thumb.png")))
+        self.assertTrue(os.path.exists(os.path.join(d, f"{sid}.thumb.png")))
 
     def test_missing_sheet_thumbnail_is_404(self):
         with self.assertRaises(HTTPException) as ctx:
@@ -506,10 +567,180 @@ class PlanPdfUploadTest(_TempDataDirs):
             self._post(b"not a pdf", "plan.pdf")
         self.assertEqual(ctx.exception.status_code, 422)
 
+    def test_garbage_content_behind_png_extension_is_422(self):
+        """The raster branch must validate too: junk bytes behind a .png
+        extension used to be accepted (autocrop swallows the decode error) and
+        later render a broken <image> — they should fail on intake with 422."""
+        with self.assertRaises(HTTPException) as ctx:
+            self._post(b"not a png", "plan.png")
+        self.assertEqual(ctx.exception.status_code, 422)
+
     def test_wrong_extension_rejected_415(self):
         with self.assertRaises(HTTPException) as ctx:
             self._post(fx.pdf_bytes(), "plan.dxf")
         self.assertEqual(ctx.exception.status_code, 415)
+
+
+class PreviewOptimizationTest(_TempDataDirs):
+    """The perf changes: live previews skip the PNG raster, saves defer it (the
+    PNG is rebuilt lazily from the saved SVG, byte-identically), and only an
+    explicit want_png/want_pdf rasters inline."""
+
+    def test_live_preview_skips_png_but_save_produces_it(self):
+        doc = self._cache_prims()
+        base: dict[str, Any] = dict(doc_id=doc, metadata={"title": "2 BED"})
+        # Live preview: no PNG in the response, no raster done.
+        prev = do_render(RenderRequest(live_preview=True, **base))
+        self.assertIsNone(prev["png_b64"])
+        # want_png: PNG present.
+        full = do_render(RenderRequest(want_png=True, **base))
+        self.assertIsNotNone(full["png_b64"])
+        # The SVG (the authoritative artifact) is identical either way.
+        self.assertEqual(prev["svg"], full["svg"])
+
+    def test_want_pdf_page_matches_sheet_aspect(self):
+        import base64, fitz
+        doc = self._cache_prims()
+        out = do_render(RenderRequest(doc_id=doc, metadata={"title": "2 BED"},
+                                      want_pdf=True))
+        self.assertIsNotNone(out["pdf_b64"])
+        pdf = base64.b64decode(out["pdf_b64"])
+        self.assertTrue(pdf.startswith(b"%PDF-"))
+        d = fitz.open(stream=pdf, filetype="pdf")
+        self.assertEqual(d.page_count, 1)
+        r = d[0].rect
+        # Page sized to the sheet's own shape: PDF_PAGE_WIDTH_IN wide, height
+        # follows the branded sheet aspect (PAGE_H > PAGE_W, portrait), no bands.
+        self.assertAlmostEqual(r.width / 72, main.PDF_PAGE_WIDTH_IN, places=1)
+        self.assertGreater(r.height, r.width)
+
+    def test_pdf_not_produced_without_want_pdf(self):
+        doc = self._cache_prims()
+        out = do_render(RenderRequest(doc_id=doc, metadata={"title": "2 BED"}))
+        self.assertIsNone(out["pdf_b64"])
+
+    def test_save_defers_png_but_serves_it_rebuilt(self):
+        doc = self._cache_prims()
+        put_property("acme", Property(id="acme", name="ACME"))
+        out = do_render(RenderRequest(doc_id=doc, property_id="acme",
+                                      metadata={"title": "2 BED"}, save=True))
+        sid = out["sheet_id"]
+        self.assertIsNone(out["png_b64"])           # no raster in the save response
+        d = os.path.join(main.SHEET_DIR, "acme")
+        # SVG persisted immediately; PNG + thumbnail deferred.
+        self.assertTrue(os.path.exists(os.path.join(d, f"{sid}.svg")))
+        self.assertFalse(os.path.exists(os.path.join(d, f"{sid}.png")))
+        self.assertFalse(os.path.exists(os.path.join(d, f"{sid}.thumb.png")))
+        # Fetching the PNG rebuilds it from the SVG and caches it back.
+        resp = get_sheet_png("acme", sid)
+        self.assertEqual(resp.media_type, "image/png")
+        self.assertTrue(os.path.exists(os.path.join(d, f"{sid}.png")))
+
+    def test_lazy_rebuilt_png_is_byte_identical_to_inline(self):
+        """The deferred rebuild must reproduce exactly what the inline save would
+        have written — same font-injected SVG, same fonts, same width."""
+        doc = self._cache_prims()
+        put_property("acme", Property(id="acme", name="ACME"))
+        inline = do_render(RenderRequest(doc_id=doc, property_id="acme",
+                                         metadata={"title": "T"}, save=True,
+                                         want_png=True))          # rasters inline
+        inline_png = bytes(get_sheet_png("acme", inline["sheet_id"]).body)
+        deferred = do_render(RenderRequest(doc_id=doc, property_id="acme",
+                                           metadata={"title": "T"}, save=True))  # deferred
+        self.assertFalse(os.path.exists(
+            os.path.join(main.SHEET_DIR, "acme", f"{deferred['sheet_id']}.png")))
+        rebuilt_png = bytes(get_sheet_png("acme", deferred["sheet_id"]).body)   # rebuilt
+        self.assertEqual(inline_png, rebuilt_png)
+
+    def test_lazy_rebuild_threads_property_brand_fonts(self):
+        """Load-bearing: the rebuild must raster with the property's uploaded
+        brand fonts, or a brand-font sheet loses all text on the fontless
+        serverless host (local system fonts would mask it). Spy on the shared
+        rasterizer to prove the property's font_faces reach it."""
+        doc = self._cache_prims()
+        faces = [{"family": "BrandFace", "data": "data:font/ttf;base64,AAAA"}]
+        put_property("acme", Property(id="acme", name="ACME", font_faces=faces))
+        sid = do_render(RenderRequest(doc_id=doc, property_id="acme",
+                                      metadata={"title": "T"}, save=True))["sheet_id"]
+        captured = {}
+        orig = main._raster_with_faces
+        main._raster_with_faces = lambda svg, w, ff: (captured.setdefault("faces", ff),
+                                                       orig(svg, w, ff))[1]
+        try:
+            get_sheet_png("acme", sid)   # deferred -> rebuild path
+        finally:
+            main._raster_with_faces = orig
+        self.assertEqual(captured.get("faces"), faces)
+
+
+class ImagePlanPreviewUrlTest(_TempDataDirs):
+    """Image/PDF plans reference the raster by /planimg URL on a live preview
+    (small payload) but inline the base64 on a save (self-contained artifact)."""
+
+    def test_preview_references_url_save_inlines(self):
+        doc = self._cache_planimg()
+        prev = do_render(RenderRequest(doc_id=doc, metadata={"title": "T"},
+                                       live_preview=True, asset_base="/api"))
+        self.assertIn(f"/api/planimg/{doc}", prev["svg"])
+        self.assertNotIn("base64,", prev["svg"])   # the multi-MB raster is NOT inlined
+
+        put_property("acme", Property(id="acme", name="ACME"))
+        saved = do_render(RenderRequest(doc_id=doc, property_id="acme",
+                                        metadata={"title": "T"}, save=True))
+        svg = bytes(get_sheet_svg("acme", saved["sheet_id"]).body).decode("utf-8")
+        self.assertIn("base64,", svg)               # saved sheet stays self-contained
+        self.assertNotIn("/planimg/", svg)
+
+    def test_malicious_asset_base_is_ignored(self):
+        doc = self._cache_planimg()
+        prev = do_render(RenderRequest(doc_id=doc, metadata={"title": "T"},
+                                       live_preview=True,
+                                       asset_base='"><script>alert(1)</script>'))
+        self.assertNotIn("<script>", prev["svg"])   # rejected -> falls back to inline
+        self.assertIn("base64,", prev["svg"])
+
+    def test_planimg_endpoint_serves_bytes_with_cache_header(self):
+        doc = self._cache_planimg()
+        resp = main.get_planimg(doc)
+        self.assertEqual(resp.media_type, "image/png")
+        self.assertIn("immutable", resp.headers["cache-control"])
+        with self.assertRaises(HTTPException) as ctx:
+            main.get_planimg("missingdoc")
+        self.assertEqual(ctx.exception.status_code, 404)
+
+
+class SheetCacheHeaderTest(_TempDataDirs):
+    """Saved-sheet artifacts are content-stable per URL (cache-busted with ?v=),
+    so they carry an immutable Cache-Control for instant library revisits."""
+
+    def test_svg_png_thumb_are_immutable(self):
+        doc = self._cache_prims()
+        put_property("acme", Property(id="acme", name="ACME"))
+        sid = do_render(RenderRequest(doc_id=doc, property_id="acme",
+                                      metadata={"title": "T"}, save=True))["sheet_id"]
+        for resp in (get_sheet_svg("acme", sid),
+                     get_sheet_png("acme", sid),
+                     get_sheet_thumb("acme", sid)):
+            self.assertIn("immutable", resp.headers["cache-control"])
+
+
+class RenderMemoTest(_TempDataDirs):
+    """Repeated identical previews hit the in-process memo instead of re-rendering."""
+
+    def test_identical_preview_is_cached_save_is_not(self):
+        main._RENDER_CACHE.clear()
+        doc = self._cache_prims()
+        req: dict[str, Any] = dict(doc_id=doc, metadata={"title": "T"}, live_preview=True)
+        do_render(RenderRequest(**req))
+        self.assertEqual(len(main._RENDER_CACHE), 1)
+        do_render(RenderRequest(**req))                 # identical -> served from memo
+        self.assertEqual(len(main._RENDER_CACHE), 1)
+        # A save never populates the memo (side effects + unique paint).
+        put_property("acme", Property(id="acme", name="ACME"))
+        before = len(main._RENDER_CACHE)
+        do_render(RenderRequest(doc_id=doc, property_id="acme",
+                                metadata={"title": "T"}, save=True))
+        self.assertEqual(len(main._RENDER_CACHE), before)
 
 
 if __name__ == "__main__":
