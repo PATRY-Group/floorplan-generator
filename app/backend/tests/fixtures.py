@@ -3,7 +3,7 @@ Shared test fixtures for the Floor Plan Sheet Generator backend suite.
 
 Everything here is **hermetic and synthetic** — DXFs are built in-memory with
 ezdxf and images with PIL, so the suite has no dependency on the transient
-`data/uploads/` cache (which the 24h sweep can empty at any time) or on a real
+`data/uploads/` cache (which the TTL sweep can empty at any time) or on a real
 Revit export. Each builder encodes *known* geometry, layers, text and units so
 tests can assert exact output rather than "it didn't crash".
 

@@ -88,8 +88,11 @@ def _classify(norm, t):
     'drop' net so a text layer named e.g. 'A_TEXT_BLOWUPS' is kept as labels and
     not dropped. wall_fill is checked before wall_line so poché doesn't pose as
     the outline; dashed before floor so 'A-FLOR-OVHD' reads as dashed overhead."""
-    # 1) Room labels — the text content is the strongest, most portable signal.
-    if t["room_text"] > 0:
+    # 1) Room labels — the text content is the strongest, most portable signal,
+    # but only when the layer is text-dominant. A geometry layer carrying one
+    # stray room word (e.g. a "DEN" tag on a wall layer) must not be reclassified
+    # to room_label, or render.py hides all its linework.
+    if t["room_text"] > 0 and t["text"] >= t["line"] + t["hatch"]:
         return "room_label", "content"
     if t["text"] > 0 and _has(norm, "anno text", "room name", "roomname",
                               "rmname", "label", "text blowup"):

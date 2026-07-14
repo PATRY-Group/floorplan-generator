@@ -179,6 +179,15 @@ class ClassifyPriorityTest(unittest.TestCase):
         self.assertEqual(_classify(_norm("A_WALL_CAVITY"), t)[0], "wall_fill")
         self.assertEqual(_classify(_norm("A_WALL_FULL_N"), t)[0], "wall_line")
 
+    def test_line_heavy_layer_with_stray_room_word_is_not_room_label(self):
+        # A geometry layer that happens to carry one stray room word (e.g. 'DEN')
+        # must NOT be swept into room_label — render.py hides room_label linework,
+        # so that would erase thousands of wall lines. The content rule is gated
+        # on the layer being text-dominant.
+        t = {"line": 5000, "hatch": 0, "text": 1, "room_text": 1, "samples": []}
+        role, _ = _classify(_norm("A-WALL"), t)
+        self.assertEqual(role, "wall_line")
+
 
 # --------------------------------------------------------------------------- #
 # /parse wiring: auto-recovery, precedence, override (sandboxed data dirs)
@@ -230,6 +239,16 @@ class ParseEndpointInferenceTest(unittest.TestCase):
         # A user-supplied map that finds no walls must fail loudly, NOT silently
         # fall back to inference — the override is an explicit choice.
         bad = json.dumps({"wall_line": ["NOPE"], "room_label": []})
+        with self.assertRaises(HTTPException) as ctx:
+            self._post(_dxf_bytes(_build_autocad_scheme_dxf), layer_map=bad)
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_malformed_layer_map_value_is_422_not_500(self):
+        # A layer_map whose value is a string (not a list of layer names) must be
+        # rejected with 422 — /render pydantic-validates the same shape, so the
+        # form endpoint shouldn't let it through to parse_dxf, where
+        # "A-WALL" + [] raises an uncaught TypeError (a 500).
+        bad = json.dumps({"wall_line": "A-WALL"})
         with self.assertRaises(HTTPException) as ctx:
             self._post(_dxf_bytes(_build_autocad_scheme_dxf), layer_map=bad)
         self.assertEqual(ctx.exception.status_code, 422)

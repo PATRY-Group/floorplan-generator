@@ -20,6 +20,7 @@ import json
 import glob as _globmod
 import shutil
 import fnmatch
+import time
 import uuid
 from datetime import datetime
 from typing import Any
@@ -130,7 +131,9 @@ def _blob_read_bytes(path):
     req = urllib.request.Request(
         b.get("downloadUrl") or b["url"],
         headers={"authorization": f"Bearer {_TOKEN}"})
-    with urllib.request.urlopen(req) as r:
+    # Timeout so a stalled download can't pin a worker indefinitely (the SDK
+    # calls use 10s; this hand-rolled read had none).
+    with urllib.request.urlopen(req, timeout=30) as r:
         return r.read()
 
 
@@ -163,7 +166,12 @@ def read_json(path, default=None) -> Any:
     data = read_bytes(path)
     if data is None:
         return default
-    return json.loads(data.decode("utf-8"))
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # A single corrupt file must not 500 a whole list endpoint (GET
+        # /properties iterates every file). Treat it like a missing one.
+        return default
 
 
 def write_json(path, obj, **dump_kw):
@@ -244,7 +252,10 @@ def getmtime(path):
     try:
         return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
     except (ValueError, AttributeError):
-        return 0.0
+        # Can't read the timestamp (e.g. an SDK shape change): fail SAFE by
+        # reporting "just now" so the TTL sweep KEEPS the file, rather than 0.0
+        # (epoch) which would read as infinitely old and mass-delete live uploads.
+        return time.time()
 
 
 def rmtree(path):

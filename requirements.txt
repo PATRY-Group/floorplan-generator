@@ -1,10 +1,9 @@
 # Vercel's Python builder parses this file directly and does NOT support `-r`
 # includes — so deps are listed inline. Keep in sync with
-# app/backend/requirements.txt, with two deliberate omissions for the serverless
+# app/backend/requirements.txt, with one deliberate omission for the serverless
 # function:
 #   - uvicorn: Vercel serves the ASGI app itself; the function never runs uvicorn.
-#   - cairosvg: the app rasterizes via resvg-py now (no libcairo on Lambda anyway).
-# Dropping both also trims the bundle against Vercel's function-size limit.
+# (PNG rasterization is resvg-py — no cairosvg/libcairo in either file.)
 fastapi>=0.110
 python-multipart>=0.0.9
 # Major-version upper bounds (kept in sync with app/backend/requirements.txt):

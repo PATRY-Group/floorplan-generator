@@ -85,19 +85,23 @@ def sweep_uploads(max_age_hours: float = UPLOAD_TTL_HOURS) -> int:
     """Delete working files in uploads/ older than max_age_hours. Returns count."""
     cutoff = time.time() - max_age_hours * 3600
     removed = 0
-    for fn in storage.glob(os.path.join(UP_DIR, "*")):
+    # Best-effort cleanup: it runs at startup and at the head of /parse and
+    # /plate, so it must never break those. In Blob mode storage.* raises the
+    # SDK's own errors (not OSError), so catch broadly — a listing hiccup should
+    # skip the sweep, not 500 the upload.
+    try:
+        entries = storage.glob(os.path.join(UP_DIR, "*"))
+    except Exception:
+        logger.exception("Uploads sweep: listing failed; skipping")
+        return 0
+    for fn in entries:
         try:
             if storage.getmtime(fn) < cutoff:
                 storage.remove(fn)
                 removed += 1
-        except OSError:
+        except Exception:
             pass
     return removed
-
-
-@app.on_event("startup")
-def _on_startup():
-    sweep_uploads()
 
 
 # --------------------------------------------------------------------------- #
@@ -162,6 +166,18 @@ async def _read_capped(file, max_bytes, too_large_detail):
     if len(raw) > max_bytes:
         raise HTTPException(status_code=413, detail=too_large_detail)
     return raw
+
+
+def _verify_raster(raw, hint="image"):
+    """Reject bytes that aren't a decodable raster with a 422. autocrop_plate
+    swallows its own decode failure and returns the input unchanged, so without
+    this a renamed/corrupt file is accepted and later renders a broken <image>."""
+    from PIL import Image
+    try:
+        Image.open(io.BytesIO(raw)).verify()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=(
+            f"Couldn't read that {hint} — upload a valid PNG or JPG. ({exc})"))
 
 
 def load_property(prop_id):
@@ -351,8 +367,14 @@ async def parse(file: UploadFile = File(...), property_id: Optional[str] = Form(
     if isinstance(layer_map, str) and layer_map.strip():
         try:
             override_map = json.loads(layer_map)
-            if not isinstance(override_map, dict):
-                raise ValueError("layer_map must be a JSON object")
+            # Match /render's pydantic Dict[str, List[str]] shape: a role mapping
+            # to a bare string (not a list) otherwise reaches parse_dxf and raises
+            # an uncaught TypeError ("A-WALL" + []) -> 500 instead of a clean 422.
+            if not isinstance(override_map, dict) or not all(
+                    isinstance(v, list) and all(isinstance(x, str) for x in v)
+                    for v in override_map.values()):
+                raise ValueError(
+                    "layer_map must be a JSON object of {role: [layer names]}")
         except (ValueError, TypeError) as exc:
             raise HTTPException(status_code=422, detail=f"Bad layer_map: {exc}")
     name = (file.filename or "").lower()
@@ -367,54 +389,70 @@ async def parse(file: UploadFile = File(...), property_id: Optional[str] = Form(
     # The source upload is written to the LOCAL filesystem (not storage/Blob) on
     # purpose: ezdxf and the ODA converter need a real file path, and it's only
     # read within this same request. On serverless this lands in /tmp (writable).
-    src_path = os.path.join(UP_DIR, f"{doc_id}_{os.path.basename(name) or 'upload'}")
+    # Sanitize the basename before it becomes a path: a char invalid on the host
+    # FS (':' etc. on Windows, or an embedded NUL) would make open() raise -> 500.
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(name)) or "upload"
+    src_path = os.path.join(UP_DIR, f"{doc_id}_{safe_name}")
     with open(src_path, "wb") as f:
         f.write(raw)
     dxf_path = src_path
-    if name.endswith(".dwg"):
-        try:
-            dxf_path = dwg_to_dxf(src_path)
-        except ConversionError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
-    elif not name.endswith(".dxf"):
-        raise HTTPException(status_code=415, detail=(
-            "Unsupported file type. Upload a DXF (or DWG if the server has the "
-            "ODA File Converter)."))
-    prop = load_property(property_id) if property_id else None
-    # Precedence: an explicit override (the user corrected the map) wins; then a
-    # saved property's map; then the Revit-scheme default. The default/property
-    # path stays byte-identical to before — inference only steps in on failure.
-    used_map = override_map or (prop or {}).get("layer_map") or DEFAULT_LAYER_MAP
-    layer_report = None
-    layer_inferred = False
+    # Local temp files (raw upload + any converted DXF) are needed only within
+    # this request; remove them in `finally`. In Blob mode the uploads sweep only
+    # lists blob keys, so these local /tmp files would otherwise accumulate until
+    # the disk fills. Only prims.json (below, via storage) must persist.
+    cleanup_paths = [src_path]
     try:
-        result = parse_dxf(dxf_path, layer_map=used_map)
-    except ParseError as exc:
-        # No wall geometry under the chosen map. If the user explicitly chose it,
-        # respect that and surface the error. Otherwise the file likely uses a
-        # non-Revit layer scheme — auto-detect the roles and try once more.
-        if override_map is not None:
-            raise HTTPException(status_code=422, detail=str(exc))
+        if name.endswith(".dwg"):
+            try:
+                dxf_path = dwg_to_dxf(src_path)
+                cleanup_paths.append(dxf_path)
+            except ConversionError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+        elif not name.endswith(".dxf"):
+            raise HTTPException(status_code=415, detail=(
+                "Unsupported file type. Upload a DXF (or DWG if the server has the "
+                "ODA File Converter)."))
+        prop = load_property(property_id) if property_id else None
+        # Precedence: an explicit override (the user corrected the map) wins; then a
+        # saved property's map; then the Revit-scheme default. The default/property
+        # path stays byte-identical to before — inference only steps in on failure.
+        used_map = override_map or (prop or {}).get("layer_map") or DEFAULT_LAYER_MAP
+        layer_report = None
+        layer_inferred = False
         try:
-            doc = readfile(dxf_path)
-            inferred, layer_report = infer_layer_map(doc)
-            result = parse_dxf(dxf_path, layer_map=inferred)
-            used_map, layer_inferred = inferred, True
-        except ParseError:
-            raise HTTPException(status_code=422, detail=str(exc))   # original guidance
-        except Exception:
-            logger.exception("Layer auto-detection failed for doc_id=%s", doc_id)
-            raise HTTPException(status_code=422, detail=str(exc))
-    # prims.json must persist for a later /render (possibly a different instance),
-    # so it goes through storage (Blob in serverless).
-    storage.write_json(os.path.join(UP_DIR, f"{doc_id}.prims.json"),
-                       {"prims": result["prims"], "extents": result["extents"]})
-    return {"doc_id": doc_id, "labels": result["labels"],
-            "ignored_text": result["ignored_text"], "suggestions": result["suggestions"],
-            "warnings": result.get("warnings", []), "extents": result["extents"],
-            "prim_count": len(result["prims"]),
-            "layer_map_used": used_map, "layer_report": layer_report,
-            "layer_inferred": layer_inferred}
+            result = parse_dxf(dxf_path, layer_map=used_map)
+        except ParseError as exc:
+            # No wall geometry under the chosen map. If the user explicitly chose it,
+            # respect that and surface the error. Otherwise the file likely uses a
+            # non-Revit layer scheme — auto-detect the roles and try once more.
+            if override_map is not None:
+                raise HTTPException(status_code=422, detail=str(exc))
+            try:
+                doc = readfile(dxf_path)
+                inferred, layer_report = infer_layer_map(doc)
+                result = parse_dxf(dxf_path, layer_map=inferred)
+                used_map, layer_inferred = inferred, True
+            except ParseError:
+                raise HTTPException(status_code=422, detail=str(exc))   # original guidance
+            except Exception:
+                logger.exception("Layer auto-detection failed for doc_id=%s", doc_id)
+                raise HTTPException(status_code=422, detail=str(exc))
+        # prims.json must persist for a later /render (possibly a different instance),
+        # so it goes through storage (Blob in serverless).
+        storage.write_json(os.path.join(UP_DIR, f"{doc_id}.prims.json"),
+                           {"prims": result["prims"], "extents": result["extents"]})
+        return {"doc_id": doc_id, "labels": result["labels"],
+                "ignored_text": result["ignored_text"], "suggestions": result["suggestions"],
+                "warnings": result.get("warnings", []), "extents": result["extents"],
+                "prim_count": len(result["prims"]),
+                "layer_map_used": used_map, "layer_report": layer_report,
+                "layer_inferred": layer_inferred}
+    finally:
+        for p in cleanup_paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------- #
@@ -424,6 +462,7 @@ async def parse(file: UploadFile = File(...), property_id: Optional[str] = Form(
 async def upload_plate(file: UploadFile = File(...)):
     sweep_uploads()
     raw = await _read_capped(file, 25 * 1024 * 1024, "Plate image too large (max 25 MB).")
+    _verify_raster(raw, "plate image")
     # The uploaded image is the finished key plan. Trim its surrounding
     # whitespace once, on intake, and store the cropped PNG — every consumer
     # (preview, footer, standalone) then sees the same tight image (WYSIWYG).
@@ -705,8 +744,11 @@ def delete_property(prop_id):
     _safe_id(prop_id, "property id")
     storage.remove(os.path.join(PROP_DIR, f"{prop_id}.json"))   # no-op if absent
     # Also drop the property's saved-sheet library; otherwise the orphaned
-    # entries keep surfacing in GET /sheets.
-    storage.rmtree(os.path.join(SHEET_DIR, prop_id))
+    # entries keep surfacing in GET /sheets. Hold the index lock so a concurrent
+    # save can't re-create index.json after the rmtree (resurrecting the property
+    # with a dangling entry).
+    with _index_lock(prop_id):
+        storage.rmtree(os.path.join(SHEET_DIR, prop_id))
     return {"deleted": prop_id}
 
 
@@ -849,6 +891,7 @@ def _render_plan_only(prop_id, sheet_id):
         return None
     config = compose_config(load_property(prop_id), cfg.get("metadata"), cfg.get("rooms"))
     config["plan_only"] = True
+    config["paint_image"] = cfg.get("paint_image")   # bake saved paint, as the in-editor plan-only download does
     raw = _read_json(os.path.join(d, f"{sheet_id}.prims.json"))
     if isinstance(raw, dict) and "prims" in raw:
         svg, png, meta = render(raw["prims"], config)

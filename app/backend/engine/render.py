@@ -102,7 +102,7 @@ def _font_stack(value, generic):
     return f"'{v}', {generic}"
 
 
-_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{3,8}$")
+_HEX_COLOR_RE = re.compile(r"^#([0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
 _DATA_IMG_RE = re.compile(r"^data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+$")
 
 
@@ -488,9 +488,12 @@ def render(prims, config):
                 target_x += [p[0] for p in poly]
                 target_y += [p[1] for p in poly]
 
-    # scale/center from wall geometry when present, else from all geometry
-    ext_x = wxs or xs
-    ext_y = wys or ys
+    # scale/center from wall geometry when present, else from all geometry.
+    # Fall back to [0.0] if a render-time layer_map dropped every prim, so the
+    # min()/max() below can't raise on an empty list (a client can park all
+    # layers in 'drop'/'floor_hatch') — matches the all-geometry guard below.
+    ext_x = wxs or xs or [0.0]
+    ext_y = wys or ys or [0.0]
     minx, maxx = min(ext_x), max(ext_x)
     miny, maxy = min(ext_y), max(ext_y)
     # True drawn bounds over ALL kept geometry (walls + doors/glazing/swings/etc.).
@@ -601,7 +604,7 @@ def render(prims, config):
     for idx, room in enumerate(rooms):
         name = (room.get("name") or "").upper()
         dims = room.get("dims") if room.get("show_dims", True) else None
-        k = float(room.get("font_scale", 1.0))
+        k = float(room.get("font_scale") or 1.0)   # tolerate explicit null/0
         n_size, n_ls = 11.5 * k, 2.2 * k
         d_size, d_ls = 10 * k, 1.2 * k
         bw = max(_text_w(name, n_size, n_ls),
